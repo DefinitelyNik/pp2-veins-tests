@@ -21,7 +21,7 @@ metric_files = [
     )]
 metric_columns = [
     f'{class_}_{metric_name}'
-    for metric_name in ['precision', 'recall']
+    for metric_name in ['dice', 'iou', 'precision', 'recall']
     for class_ in ['veins', 'arteries', 'crossings']
 ]
 
@@ -40,6 +40,6 @@ for metric in metrics:
         col: format_mean_std(metric[1][col])
         for col in metric_columns
     }
-total.to_excel('Classes precision recall.xlsx')
+total.to_excel('Classes precision recall dice iou.xlsx')
 
 # print(format_mean_std(metrics['DL-CE']['veins_recall']))

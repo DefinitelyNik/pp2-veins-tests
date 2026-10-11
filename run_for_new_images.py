@@ -13,8 +13,13 @@ from common import metrics
 
 
 # --- ВЫБОР МОДЕЛИ: замени на свою, как в основном пайплайне ---
+<<<<<<< HEAD
 from UNETPP_WCT.model import UNetPPWCT, val_extra_transforms
 ModelClass = UNetPPWCT
+=======
+from UNETPP_WCD.model import ImprovedUNetPlusPlus, val_extra_transforms
+ModelClass = ImprovedUNetPlusPlus
+>>>>>>> d2abc896 (feat pp-veins: add patching)
 
 
 # --- ПУТИ ---

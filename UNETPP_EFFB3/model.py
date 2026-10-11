@@ -14,7 +14,6 @@ from common import utils
 
 
 # --- параметры эксперимента ---
-IMG_SIZE = 512
 EPOCHS_COUNT = 50
 LEARNING_RATE = 1e-4
 
@@ -25,12 +24,10 @@ STD = (0.229, 0.224, 0.225)
 
 # Дополнительные трансформации. ToTensorV2 добавляется в common/data_preparation.py
 train_extra_transforms = [
-    A.Resize(IMG_SIZE, IMG_SIZE, interpolation=1, mask_interpolation=0),
     A.Normalize(mean=MEAN, std=STD),
 ]
 
 val_extra_transforms = [
-    A.Resize(IMG_SIZE, IMG_SIZE, interpolation=1, mask_interpolation=0),
     A.Normalize(mean=MEAN, std=STD),
 ]
 
@@ -99,11 +96,14 @@ class UNetPlusPlusEffB3(BaseModel):
         patience_counter = 0
         start = time.time()
 
+        start = time.time()
         for epoch in range(EPOCHS_COUNT):
+            print(f'epoch: {epoch}')
             self.model.train()
             train_loss = 0.0
 
             for images, masks in train_loader:
+                print(f'Image')
                 images = images.to(settings.DEVICE)
                 masks = masks.to(settings.DEVICE)
 
@@ -116,6 +116,11 @@ class UNetPlusPlusEffB3(BaseModel):
                 train_loss += loss.item()
 
             train_loss /= len(train_loader)
+
+
+            approx_time_left = (time.time() - start) / (epoch + 1) * (EPOCHS_COUNT - epoch - 1)
+            time_left_str = utils.beautify_time_left(approx_time_left)
+            print(f"Epoch {epoch+1}/{EPOCHS_COUNT} | Train Loss: {train_loss:.4f} | Left approx {time_left_str}")
 
             val_loss = None
             if val_loader is not None:

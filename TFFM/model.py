@@ -42,11 +42,13 @@ class TFFMModel(BaseModel):
             config=self.config,
             num_classes=settings.NUM_CLASSES,
         ).to(settings.DEVICE)
+        print(settings.DEVICE)
         self.optimizer = optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
         self.criterion = nn.CrossEntropyLoss()
         self.LEARNING_RATE = LEARNING_RATE
 
     def fit(self, train_loader, val_loader=None, save_best=True, patience=None, **kwargs):
+        print(f'Start fitting')
         best_val_loss = float('inf')
         best_state = None
         patience_counter = 0

@@ -3,7 +3,7 @@ from pathlib import Path
 
 # Пути
 BASE_DIR = Path(__file__).parent.parent
-DATASET_DIR = BASE_DIR / "dataset"
+DATASET_DIR = BASE_DIR / "dataset_patches_256"
 # TRAIN_IMG_DIR = DATASET_DIR / "train" / "images"
 # TRAIN_MASK_DIR = DATASET_DIR / "train" / "masks"
 # TEST_IMG_DIR = DATASET_DIR / "test" / "images"
@@ -14,7 +14,7 @@ DATASET_MASK_DIR = DATASET_DIR / "masks"
 TRAIN_MASK_DIR = DATASET_DIR / "masks"
 
 FOLDS_NUM = 3
-TEST_SIZE = 20
+TEST_SIZE = 300
 
 CONFIDENCE_LEVEL = 0.95
 

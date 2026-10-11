@@ -1,3 +1,4 @@
+import time
 import pathlib
 from typing import Optional
 
@@ -10,6 +11,7 @@ import torch.optim as optim
 
 from common import settings
 from common.base_model import BaseModel
+from common import utils
 
 
 NUM_CLASSES = settings.NUM_CLASSES
@@ -133,6 +135,7 @@ class ImprovedUNetPlusPlus(BaseModel):
         patience_counter = 0
         self._ensure_scheduler(len(train_loader))
 
+        start = time.time()
         for epoch in range(EPOCHS_COUNT):
             self.model.train()
             train_loss = 0.0
@@ -159,6 +162,10 @@ class ImprovedUNetPlusPlus(BaseModel):
                 f"Epoch {epoch + 1}/{EPOCHS_COUNT} | "
                 f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {current_lr:.6f}"
             )
+
+            approx_time_left = (time.time() - start) / (epoch + 1) * (EPOCHS_COUNT - epoch - 1)
+            time_left_str = utils.beautify_time_left(approx_time_left)
+            print(f"Epoch {epoch+1}/{EPOCHS_COUNT} | Train Loss: {train_loss:.4f} | Left approx {time_left_str}")
 
             if save_best and val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -203,15 +210,15 @@ class ImprovedUNetPlusPlus(BaseModel):
 
     @staticmethod
     def get_model_save_path(fold_num: int) -> pathlib.Path:
-        return pathlib.Path(f"IMPROVED_ARTEM_UNETPP/weights_{fold_num} copy.pth")
+        return pathlib.Path(f"UNETPP_DF/weights_{fold_num}_cut.pth")
 
     @staticmethod
     def get_interval_metrics_save_path() -> pathlib.Path:
-        return pathlib.Path("IMPROVED_ARTEM_UNETPP/interval_metrics.csv")
+        return pathlib.Path("UNETPP_DF/interval_metrics_cut.csv")
 
     @staticmethod
     def get_raw_metrics_save_path() -> pathlib.Path:
-        return pathlib.Path("IMPROVED_ARTEM_UNETPP/raw_metrics.csv")
+        return pathlib.Path("UNETPP_DF/raw_metrics_cut.csv")
 
     @staticmethod
     def get_model_name():

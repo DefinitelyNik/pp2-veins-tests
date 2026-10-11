@@ -10,7 +10,7 @@ from TFFM.model import TFFMModel, train_extra_transforms, val_extra_transforms
 ModelClass = TFFMModel
 
 # --- ПАРАМЕТРЫ ПАЙПЛАЙНА ---
-USE_FITTED = True               # False – обучить, True – загрузить готовую
+USE_FITTED = False               # False – обучить, True – загрузить готовую
 INTERVAL_METRICS_SAVE_PATH = ModelClass.get_interval_metrics_save_path()
 RAW_METRICS_SAVE_PATH = ModelClass.get_raw_metrics_save_path()
 
