@@ -10,6 +10,7 @@ import torch.optim as optim
 
 from common import settings
 from common.base_model import BaseModel
+from common.topological_loss import TopologicalVesselLoss
 
 
 NUM_CLASSES = settings.NUM_CLASSES
@@ -38,17 +39,26 @@ val_extra_transforms = [
 class CombinedLoss(nn.Module):
     """Focal + Dice: без CrossEntropyLoss, с упором на редкие и трудные классы."""
 
-    def __init__(self, focal_weight: float = 0.7, dice_weight: float = 0.3):
+    def __init__(self, focal_weight: float = 0.6, dice_weight: float = 0.3, topo_weight: float = 0.1):
         super().__init__()
         self.focal = smp.losses.FocalLoss(mode="multiclass", gamma=2.0)
         self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
+
+        # Инициализация топологического лосса
+        self.topo = TopologicalVesselLoss(num_classes=settings.NUM_CLASSES)
+
         self.focal_weight = focal_weight
         self.dice_weight = dice_weight
+        self.topo_weight = topo_weight
 
-    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        focal_loss = self.focal(logits, target)
-        dice_loss = self.dice(logits, target)
-        return self.focal_weight * focal_loss + self.dice_weight * dice_loss
+    def forward(self, logits, targets):
+        loss_focal = self.focal(logits, targets)
+        loss_dice = self.dice(logits, targets)
+        loss_topo = self.topo(logits, targets)
+
+        return (self.focal_weight * loss_focal +
+                self.dice_weight * loss_dice +
+                self.topo_weight * loss_topo)
 
 
 class ImprovedUNetPlusPlus(BaseModel):

@@ -11,6 +11,7 @@ import albumentations as A
 from common.base_model import BaseModel
 from common import settings
 from common import utils
+from common.topological_loss import TopologicalVesselLoss
 
 
 # --- параметры эксперимента ---
@@ -40,15 +41,23 @@ class WeightedCEDiceLoss(nn.Module):
     Weighted CrossEntropy + DiceLoss для multiclass segmentation.
     CE помогает пиксельной классификации, Dice помогает при сильном дисбалансе классов.
     """
-    def __init__(self, class_weights=None, ce_coef=1.0, dice_coef=1.0):
+
+    def __init__(self, class_weights=None, ce_coef=0.9, dice_coef=0.9, topo_coef=0.1):
         super().__init__()
         self.ce = nn.CrossEntropyLoss(weight=class_weights)
         self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
+        self.topo = TopologicalVesselLoss(num_classes=settings.NUM_CLASSES)
+
         self.ce_coef = ce_coef
         self.dice_coef = dice_coef
+        self.topo_coef = topo_coef
 
     def forward(self, logits, targets):
-        return self.ce_coef * self.ce(logits, targets) + self.dice_coef * self.dice(logits, targets)
+        loss_ce = self.ce(logits, targets)
+        loss_dice = self.dice(logits, targets)
+        loss_topo = self.topo(logits, targets)
+
+        return self.ce_coef * loss_ce + self.dice_coef * loss_dice + self.topo_coef * loss_topo
 
 
 class UNetPlusPlusEffB3(BaseModel):
@@ -64,7 +73,7 @@ class UNetPlusPlusEffB3(BaseModel):
         self.optimizer = optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
 
         # Изначально без весов. Реальные веса считаем по train_loader внутри fit().
-        self.criterion = WeightedCEDiceLoss(class_weights=None)
+        self.criterion = WeightedCEDiceTopoLoss(class_weights=None)
         self.LEARNING_RATE = LEARNING_RATE
         self.is_fitted = False
 
