@@ -36,13 +36,12 @@ val_extra_transforms = [
 ]
 
 
-class WeightedCEDiceLoss(nn.Module):
+class WeightedCEDiceTopoLoss(nn.Module):
     """
-    Weighted CrossEntropy + DiceLoss для multiclass segmentation.
-    CE помогает пиксельной классификации, Dice помогает при сильном дисбалансе классов.
+    Weighted CrossEntropy + DiceLoss + Topological Loss.
     """
 
-    def __init__(self, class_weights=None, ce_coef=0.9, dice_coef=0.9, topo_coef=0.1):
+    def __init__(self, class_weights=None, ce_coef=1.0, dice_coef=1.0, topo_coef=0.05):
         super().__init__()
         self.ce = nn.CrossEntropyLoss(weight=class_weights)
         self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)

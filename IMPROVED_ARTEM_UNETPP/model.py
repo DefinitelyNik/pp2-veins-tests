@@ -37,24 +37,33 @@ val_extra_transforms = [
 
 
 class CombinedLoss(nn.Module):
-    """Focal + Dice: без CrossEntropyLoss, с упором на редкие и трудные классы."""
+    """Focal + Dice + Topological с Warm-up"""
 
-    def __init__(self, focal_weight: float = 0.6, dice_weight: float = 0.3, topo_weight: float = 0.1):
+    def __init__(self, focal_weight: float = 0.7, dice_weight: float = 0.3, topo_weight: float = 0.15):
         super().__init__()
         self.focal = smp.losses.FocalLoss(mode="multiclass", gamma=2.0)
         self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
-
-        # Инициализация топологического лосса
         self.topo = TopologicalVesselLoss(num_classes=settings.NUM_CLASSES)
 
         self.focal_weight = focal_weight
         self.dice_weight = dice_weight
         self.topo_weight = topo_weight
 
-    def forward(self, logits, targets):
+    def forward(self, logits, targets, current_epoch: int = 0):
         loss_focal = self.focal(logits, targets)
         loss_dice = self.dice(logits, targets)
-        loss_topo = self.topo(logits, targets)
+
+        # WARM-UP: Топологический лосс включается только после 15 эпохи
+        warmup_epochs = 15
+        if current_epoch < warmup_epochs:
+            # Плавное включение с 10 по 15 эпоху (опционально)
+            if current_epoch > warmup_epochs - 5:
+                scale = (current_epoch - (warmup_epochs - 5)) / 5.0
+                loss_topo = self.topo(logits, targets) * scale
+            else:
+                loss_topo = 0.0
+        else:
+            loss_topo = self.topo(logits, targets)
 
         return (self.focal_weight * loss_focal +
                 self.dice_weight * loss_dice +
@@ -153,7 +162,7 @@ class ImprovedUNetPlusPlus(BaseModel):
 
                 self.optimizer.zero_grad(set_to_none=True)
                 logits = self.model(images)
-                loss = self.criterion(logits, masks)
+                loss = self.criterion(logits, masks, current_epoch=epoch)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
