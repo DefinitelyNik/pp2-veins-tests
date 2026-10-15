@@ -100,7 +100,7 @@ class UNetPlusPlusEffB3(BaseModel):
 
     def fit(self, train_loader, val_loader=None, save_best=True, patience=None, **kwargs):
         class_weights = self._compute_class_weights(train_loader)
-        self.criterion = WeightedCEDiceLoss(class_weights=class_weights).to(settings.DEVICE)
+        self.criterion = WeightedCEDiceTopoLoss(class_weights=class_weights).to(settings.DEVICE)
 
         best_val_loss = float("inf")
         best_state = None
