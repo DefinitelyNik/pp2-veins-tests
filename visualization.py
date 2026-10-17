@@ -3,8 +3,9 @@ import common.settings as settings
 import common.data_preparation as data_prep
 
 # --- ВЫБОР МОДЕЛИ (такой же, как в run_pipeline.py) ---
-from UNETPP_EFFB3.model import UNetPlusPlusEffB3, train_extra_transforms, val_extra_transforms
-ModelClass = UNetPlusPlusEffB3
+from IMPROVED_ARTEM_UNETPP.model import ImprovedUNetPlusPlus, train_extra_transforms, val_extra_transforms
+
+ModelClass = ImprovedUNetPlusPlus
 
 # --- ПАРАМЕТРЫ ВИЗУАЛИЗАЦИИ ---
 NUM_SAMPLES = 5
