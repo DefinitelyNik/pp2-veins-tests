@@ -1,7 +1,6 @@
 import time
 import pathlib
 from typing import Optional
-
 import albumentations as A
 import numpy as np
 from PIL import Image
@@ -9,22 +8,26 @@ import segmentation_models_pytorch as smp
 import torch
 import torch.nn as nn
 import torch.optim as optim
-
 from common import settings_patches as settings
 from common.base_model import BaseModel
 from common import utils
 
+# НОВЫЙ ИМПОРТ
+from UNETPP_WCD.topological_loss import WeightedCEDiceTopoLoss
 
 NUM_CLASSES = settings.NUM_CLASSES
 EPOCHS_COUNT = 50
 LEARNING_RATE = 3e-4
 WEIGHT_DECAY = 1e-4
-
 ENCODER_NAME = "efficientnet-b0"
 ENCODER_WEIGHTS = "imagenet"
-
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
+
+# НОВЫЕ ГИПЕРПАРАМЕТРЫ для топологического лосса
+TOPO_COEF = 0.1           # Вес топологического лосса (PH weight из статьи)
+TOPO_TEMPERATURE = 1.0    # Температура для softmax (в статье τ=0.2 была для contrastive)
+TOPO_WARMUP_EPOCHS = 10   # Warmup эпох (в статье Figure 8 - 10 эпох)
 
 train_extra_transforms = [
     A.Normalize(mean=MEAN, std=STD),
@@ -34,21 +37,6 @@ val_extra_transforms = [
     A.Normalize(mean=MEAN, std=STD),
 ]
 
-
-class WeightedCEDiceLoss(nn.Module):
-    """
-    Weighted CrossEntropy + DiceLoss для multiclass segmentation.
-    CE помогает пиксельной классификации, Dice помогает при сильном дисбалансе классов.
-    """
-    def __init__(self, class_weights=None, ce_coef=1.0, dice_coef=1.0):
-        super().__init__()
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
-        self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
-        self.ce_coef = ce_coef
-        self.dice_coef = dice_coef
-
-    def forward(self, logits, targets):
-        return self.ce_coef * self.ce(logits, targets) + self.dice_coef * self.dice(logits, targets)
 
 class ImprovedUNetPlusPlus(BaseModel):
     def __init__(self):
@@ -62,7 +50,17 @@ class ImprovedUNetPlusPlus(BaseModel):
 
         class_weights = self._build_class_weights().to(settings.DEVICE)
         self.class_weights = class_weights
-        self.criterion = WeightedCEDiceLoss(class_weights=class_weights)
+
+        # ИСПОЛЬЗУЕМ НОВЫЙ КОМБИНИРОВАННЫЙ ЛОСС
+        self.criterion = WeightedCEDiceTopoLoss(
+            class_weights=class_weights,
+            ce_coef=1.0,
+            dice_coef=1.0,
+            topo_coef=TOPO_COEF,
+            topo_temperature=TOPO_TEMPERATURE,
+            topo_warmup_epochs=TOPO_WARMUP_EPOCHS,
+        )
+
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=LEARNING_RATE,
@@ -74,17 +72,10 @@ class ImprovedUNetPlusPlus(BaseModel):
 
     def _build_class_weights(self) -> torch.Tensor:
         print(f'Building class weights')
-        """
-        Считаем частоты классов в train для диагностики дисбаланса.
-        Подготовку данных и pipeline не меняем.
-        """
         mask_paths = sorted(settings.TRAIN_MASK_DIR.glob("*.png"))
         class_counts = np.zeros(NUM_CLASSES, dtype=np.float64)
-
         color_map = {k: np.array(v, dtype=np.uint8) for k, v in settings.COLOR_MAP.items()}
-
         for i, mask_path in enumerate(mask_paths, start=1):
-            # print(f'Mask path: {i} / {len(mask_paths)}')
             mask_rgb = np.array(Image.open(mask_path).convert("RGB"))
             mask_labels = np.zeros(mask_rgb.shape[:2], dtype=np.uint8)
             for class_idx, color in color_map.items():
@@ -96,6 +87,7 @@ class ImprovedUNetPlusPlus(BaseModel):
         effective_num = 1.0 - np.power(beta, class_counts)
         weights = (1.0 - beta) / np.maximum(effective_num, 1e-12)
         weights = weights / weights.mean()
+
         print(f'Weights are built')
         return torch.tensor(weights, dtype=torch.float32)
 
@@ -125,25 +117,29 @@ class ImprovedUNetPlusPlus(BaseModel):
 
     def fit(self, train_loader, val_loader: Optional[torch.utils.data.DataLoader] = None,
             save_best: bool = True, patience=None, **kwargs):
-
         print(f'Start fitting')
-        # if val_loader is None:
-        #     val_loader = train_loader
-
         best_val_loss = float("inf")
         best_state = None
         patience_counter = 0
         self._ensure_scheduler(len(train_loader))
-
         start = time.time()
+
         for epoch in range(EPOCHS_COUNT):
+            # ПЕРЕДАЕМ НОМЕР ЭПОХИ В ЛОСС для warmup логики
+            self.criterion.set_epoch(epoch)
+
             self.model.train()
             train_loss = 0.0
+
+            # Для логирования компонентов лосса
+            epoch_ce = 0.0
+            epoch_dice = 0.0
+            epoch_topo = 0.0
+            num_batches = 0
 
             for images, masks in train_loader:
                 images = images.to(settings.DEVICE, non_blocking=True)
                 masks = masks.to(settings.DEVICE, non_blocking=True)
-
                 self.optimizer.zero_grad(set_to_none=True)
                 logits = self.model(images)
                 loss = self.criterion(logits, masks)
@@ -151,17 +147,31 @@ class ImprovedUNetPlusPlus(BaseModel):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 self.scheduler.step()
-
                 train_loss += loss.item()
 
-            train_loss /= max(len(train_loader), 1)
-            # val_loss = self._evaluate_loss(val_loader)
-            current_lr = self.optimizer.param_groups[0]["lr"]
+                # НОВОЕ: логируем компоненты
+                components = self.criterion.get_loss_components(logits, masks)
+                epoch_ce += components['ce']
+                epoch_dice += components['dice']
+                epoch_topo += components['topo']
+                num_batches += 1
 
+            train_loss /= max(len(train_loader), 1)
+            epoch_ce /= max(num_batches, 1)
+            epoch_dice /= max(num_batches, 1)
+            epoch_topo /= max(num_batches, 1)
+
+            current_lr = self.optimizer.param_groups[0]["lr"]
             approx_time_left = (time.time() - start) / (epoch + 1) * (EPOCHS_COUNT - epoch - 1)
             time_left_str = utils.beautify_time_left(approx_time_left)
-            print(f"Epoch {epoch+1}/{EPOCHS_COUNT} | Train Loss: {train_loss:.4f} | Left approx {time_left_str}")
 
+            # НОВОЕ: расширенное логирование с компонентами лосса
+            topo_status = "ACTIVE" if epoch >= TOPO_WARMUP_EPOCHS else "warmup"
+            print(
+                f"Epoch {epoch + 1}/{EPOCHS_COUNT} | "
+                f"Loss: {train_loss:.4f} (CE: {epoch_ce:.4f}, Dice: {epoch_dice:.4f}, Topo[{topo_status}]: {epoch_topo:.4f}) | "
+                f"Left: {time_left_str}"
+            )
 
         self.is_fitted = True
 
@@ -180,6 +190,10 @@ class ImprovedUNetPlusPlus(BaseModel):
             "num_classes": NUM_CLASSES,
             "LEARNING_RATE": self.LEARNING_RATE,
             "encoder_name": ENCODER_NAME,
+            # НОВОЕ: сохраняем параметры топологического лосса
+            "topo_coef": TOPO_COEF,
+            "topo_temperature": TOPO_TEMPERATURE,
+            "topo_warmup_epochs": TOPO_WARMUP_EPOCHS,
         }, path)
 
     def load(self, path):
@@ -203,7 +217,7 @@ class ImprovedUNetPlusPlus(BaseModel):
 
     @staticmethod
     def get_model_name():
-        return 'UNET-WCD'
+        return 'UNET-WCD-Topo'  # Обновленное имя модели
 
     @staticmethod
     def get_val_viz_path() -> pathlib.Path:
