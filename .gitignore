@@ -208,3 +208,8 @@ __marimo__/
 
 
 *.eth
+*.pth
+**/val_viz_patches/**
+**/val_viz_patches_overlap/**
+**/external_eval_patches/**
+**/external_eval_patches_overlap/**
