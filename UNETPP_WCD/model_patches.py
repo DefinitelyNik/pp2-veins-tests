@@ -11,33 +11,58 @@ import torch.optim as optim
 from common import settings_patches as settings
 from common.base_model import BaseModel
 from common import utils
-
-from UNETPP_WCD.topological_loss import WeightedFocalDiceTopoLoss
+from UNETPP_WCD.topology_loss import SoftEulerCharacteristicLoss
 
 NUM_CLASSES = settings.NUM_CLASSES
-EPOCHS_COUNT = 50                # ← фиксировано 50
-LEARNING_RATE = 3e-4
+EPOCHS_COUNT = 60  # Увеличено с 50 до 60 для лучшей сходимости с топологическим лоссом
+LEARNING_RATE = 2e-4  # Немного снижен для стабильности с новым лоссом
 WEIGHT_DECAY = 1e-4
 ENCODER_NAME = "efficientnet-b0"
 ENCODER_WEIGHTS = "imagenet"
 MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
-# ─── Гиперпараметры лосса ────────────────────────────────────────────
-FOCAL_GAMMA = 2.0
-FOCAL_COEF = 1.0
-DICE_COEF = 2.0                  # усилен: редкие классы важнее
-TOPO_COEF = 0.001                # очень мягкий, чтобы не ломать сегментацию
-TOPO_TEMPERATURE = 1.0
-TOPO_WARMUP_EPOCHS = 5           # 5 эпох без Topo
-TOPO_RAMPUP_EPOCHS = 7           # эпохи 6–12: плавный рост
-# ──────────────────────────────────────────────────────────────────────
+# Warmup эпохи для топологического лосса (из статьи)
+TOPOLOGY_WARMUP_EPOCHS = 10
+TOPOLOGY_LOSS_COEF = 0.1  # Коэффициент для топологического лосса
 
-train_extra_transforms = [A.Normalize(mean=MEAN, std=STD)]
-val_extra_transforms = [A.Normalize(mean=MEAN, std=STD)]
+train_extra_transforms = [
+    A.Normalize(mean=MEAN, std=STD),
+]
+
+val_extra_transforms = [
+    A.Normalize(mean=MEAN, std=STD),
+]
+
+
+class WeightedCEDiceTopologyLoss(nn.Module):
+    """
+    Комбинированный лосс: Weighted CrossEntropy + DiceLoss + Soft Euler Characteristic Loss
+    для multiclass segmentation с учетом топологии.
+    """
+
+    def __init__(self, class_weights=None, ce_coef=1.0, dice_coef=1.0, topo_coef=0.1):
+        super().__init__()
+        self.ce = nn.CrossEntropyLoss(weight=class_weights)
+        self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
+        self.topo = SoftEulerCharacteristicLoss(class_weights=class_weights, from_logits=True)
+        self.ce_coef = ce_coef
+        self.dice_coef = dice_coef
+        self.topo_coef = topo_coef
+        self.class_weights = class_weights
+
+    def forward(self, logits, targets, epoch=0, warmup_epochs=TOPOLOGY_WARMUP_EPOCHS):
+        ce_loss = self.ce(logits, targets)
+        dice_loss = self.dice(logits, targets)
+        topo_loss = self.topo(logits, targets, epoch=epoch, warmup_epochs=warmup_epochs)
+
+        return (self.ce_coef * ce_loss +
+                self.dice_coef * dice_loss +
+                self.topo_coef * topo_loss)
 
 
 class ImprovedUNetPlusPlus(BaseModel):
+
     def __init__(self):
         super().__init__()
         self.model = smp.UnetPlusPlus(
@@ -49,18 +74,12 @@ class ImprovedUNetPlusPlus(BaseModel):
 
         class_weights = self._build_class_weights().to(settings.DEVICE)
         self.class_weights = class_weights
-
-        self.criterion = WeightedFocalDiceTopoLoss(
+        self.criterion = WeightedCEDiceTopologyLoss(
             class_weights=class_weights,
-            focal_gamma=FOCAL_GAMMA,
-            focal_coef=FOCAL_COEF,
-            dice_coef=DICE_COEF,
-            topo_coef=TOPO_COEF,
-            topo_temperature=TOPO_TEMPERATURE,
-            topo_warmup_epochs=TOPO_WARMUP_EPOCHS,
-            topo_rampup_epochs=TOPO_RAMPUP_EPOCHS,
+            ce_coef=1.0,
+            dice_coef=1.0,
+            topo_coef=TOPOLOGY_LOSS_COEF
         )
-
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=LEARNING_RATE,
@@ -69,43 +88,31 @@ class ImprovedUNetPlusPlus(BaseModel):
         self.scheduler = None
         self.LEARNING_RATE = LEARNING_RATE
         self.is_fitted = False
+        self.current_epoch = 0
 
-    # ── Агрессивные веса классов ──────────────────────────────────────
     def _build_class_weights(self) -> torch.Tensor:
-        print('Building class weights')
+        print(f'Building class weights')
+        """
+        Считаем частоты классов в train для диагностики дисбаланса.
+        Подготовку данных и pipeline не меняем.
+        """
         mask_paths = sorted(settings.TRAIN_MASK_DIR.glob("*.png"))
         class_counts = np.zeros(NUM_CLASSES, dtype=np.float64)
-        color_map = {k: np.array(v, dtype=np.uint8)
-                     for k, v in settings.COLOR_MAP.items()}
-
-        for mask_path in mask_paths:
+        color_map = {k: np.array(v, dtype=np.uint8) for k, v in settings.COLOR_MAP.items()}
+        for i, mask_path in enumerate(mask_paths, start=1):
+            # print(f'Mask path: {i} / {len(mask_paths)}')
             mask_rgb = np.array(Image.open(mask_path).convert("RGB"))
             mask_labels = np.zeros(mask_rgb.shape[:2], dtype=np.uint8)
-            for cls_idx, color in color_map.items():
-                mask_labels[np.all(mask_rgb == color, axis=-1)] = cls_idx
-            class_counts += np.bincount(mask_labels.reshape(-1),
-                                        minlength=NUM_CLASSES)
-
-        # Effective-number weights (beta ближе к 1 → сильнее давим редкие)
-        beta = 0.99999
-        eff = 1.0 - np.power(beta, class_counts)
-        w_eff = (1.0 - beta) / np.maximum(eff, 1e-12)
-        w_eff /= w_eff.mean()
-
-        # Frequency weights
-        median_freq = np.median(class_counts)
-        freq = class_counts / class_counts.sum()
-        w_freq = median_freq / (freq * NUM_CLASSES + 1e-10)
-
-        # Комбинация
-        w = 0.5 * w_eff + 0.5 * w_freq
-        w /= w.sum()
-        w *= NUM_CLASSES
-
-        print(f'  counts : {class_counts}')
-        print(f'  weights: {np.round(w, 4)}')
-        return torch.tensor(w, dtype=torch.float32)
-    # ────────────────────────────────────────────────────────────────────
+            for class_idx, color in color_map.items():
+                mask_labels[np.all(mask_rgb == color, axis=-1)] = class_idx
+            bincount = np.bincount(mask_labels.reshape(-1), minlength=NUM_CLASSES)
+            class_counts += bincount
+        beta = 0.9999
+        effective_num = 1.0 - np.power(beta, class_counts)
+        weights = (1.0 - beta) / np.maximum(effective_num, 1e-12)
+        weights = weights / weights.mean()
+        print(f'Weights are built')
+        return torch.tensor(weights, dtype=torch.float32)
 
     def _ensure_scheduler(self, train_loader_len: int) -> None:
         if self.scheduler is None:
@@ -120,69 +127,58 @@ class ImprovedUNetPlusPlus(BaseModel):
                 final_div_factor=100.0,
             )
 
-    def fit(self, train_loader, val_loader=None,
-            save_best=True, patience=None, **kwargs):
-        print(f'Start fitting  ({EPOCHS_COUNT} epochs)')
+    def _evaluate_loss(self, loader) -> float:
+        self.model.eval()
+        loss_total = 0.0
+        with torch.no_grad():
+            for images, masks in loader:
+                images = images.to(settings.DEVICE, non_blocking=True)
+                masks = masks.to(settings.DEVICE, non_blocking=True)
+                logits = self.model(images)
+                loss_total += self.criterion(logits, masks, epoch=self.current_epoch).item()
+        return loss_total / max(len(loader), 1)
+
+    def fit(self, train_loader, val_loader: Optional[torch.utils.data.DataLoader] = None,
+            save_best: bool = True, patience=None, **kwargs):
+        print(f'Start fitting')
+        # if val_loader is None:
+        #     val_loader = train_loader
+        best_val_loss = float("inf")
+        best_state = None
+        patience_counter = 0
         self._ensure_scheduler(len(train_loader))
         start = time.time()
-
         for epoch in range(EPOCHS_COUNT):
-            self.criterion.set_epoch(epoch)
+            self.current_epoch = epoch
             self.model.train()
-
-            ep_focal = ep_dice = ep_topo = ep_total = 0.0
-            n = 0
-
+            train_loss = 0.0
             for images, masks in train_loader:
                 images = images.to(settings.DEVICE, non_blocking=True)
                 masks = masks.to(settings.DEVICE, non_blocking=True)
-
                 self.optimizer.zero_grad(set_to_none=True)
                 logits = self.model(images)
-                loss = self.criterion(logits, masks)
+                loss = self.criterion(logits, masks, epoch=epoch, warmup_epochs=TOPOLOGY_WARMUP_EPOCHS)
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 self.scheduler.step()
-
-                comp = self.criterion.get_loss_components(logits, masks)
-                ep_focal += comp['focal']
-                ep_dice += comp['dice']
-                ep_topo += comp['topo']
-                ep_total += loss.item()
-                n += 1
-
-            ep_focal /= max(n, 1)
-            ep_dice /= max(n, 1)
-            ep_topo /= max(n, 1)
-            ep_total /= max(n, 1)
-
-            w = self.criterion._topo_weight()
-            if epoch < TOPO_WARMUP_EPOCHS:
-                tag = "warmup"
-            elif w < TOPO_COEF:
-                tag = f"rampup {w:.5f}"
-            else:
-                tag = f"ACTIVE  {w:.5f}"
-
-            elapsed = time.time() - start
-            left = elapsed / (epoch + 1) * (EPOCHS_COUNT - epoch - 1)
-
+                train_loss += loss.item()
+            train_loss /= max(len(train_loader), 1)
+            # val_loss = self._evaluate_loss(val_loader)
+            current_lr = self.optimizer.param_groups[0]["lr"]
+            approx_time_left = (time.time() - start) / (epoch + 1) * (EPOCHS_COUNT - epoch - 1)
+            time_left_str = utils.beautify_time_left(approx_time_left)
             print(
-                f"Epoch {epoch+1:2d}/{EPOCHS_COUNT} | "
-                f"Loss: {ep_total:.4f}  "
-                f"(Focal: {ep_focal:.4f}  Dice: {ep_dice:.4f}  "
-                f"Topo[{tag}]: {ep_topo:.2f}) | "
-                f"Left: {utils.beautify_time_left(left)}"
-            )
-
+                f"Epoch {epoch + 1}/{EPOCHS_COUNT} | Train Loss: {train_loss:.4f} | LR: {current_lr:.2e} | Left approx {time_left_str}")
         self.is_fitted = True
 
     def predict(self, images: torch.Tensor) -> torch.Tensor:
         self.model.eval()
         with torch.no_grad():
             images = images.to(settings.DEVICE, non_blocking=True)
-            return torch.argmax(self.model(images), dim=1).cpu()
+            logits = self.model(images)
+            preds = torch.argmax(logits, dim=1)
+        return preds.cpu()
 
     def save(self, path):
         torch.save({
@@ -194,10 +190,10 @@ class ImprovedUNetPlusPlus(BaseModel):
         }, path)
 
     def load(self, path):
-        ckpt = torch.load(path, map_location=settings.DEVICE)
-        self.model.load_state_dict(ckpt["model_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        checkpoint = torch.load(path, map_location=settings.DEVICE)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         self.is_fitted = True
 
     @staticmethod
@@ -214,7 +210,7 @@ class ImprovedUNetPlusPlus(BaseModel):
 
     @staticmethod
     def get_model_name():
-        return 'UNET-WCD-FocalTopo'
+        return 'UNET-WCD'
 
     @staticmethod
     def get_val_viz_path() -> pathlib.Path:
