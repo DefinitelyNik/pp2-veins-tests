@@ -14,7 +14,7 @@ from common import utils
 from UNETPP_WCD.topology_loss import SoftEulerCharacteristicLoss
 
 NUM_CLASSES = settings.NUM_CLASSES
-EPOCHS_COUNT = 60  # Увеличено с 50 до 60 для лучшей сходимости с топологическим лоссом
+EPOCHS_COUNT = 50  # Увеличено с 50 до 60 для лучшей сходимости с топологическим лоссом
 LEARNING_RATE = 2e-4  # Немного снижен для стабильности с новым лоссом
 WEIGHT_DECAY = 1e-4
 ENCODER_NAME = "efficientnet-b0"
