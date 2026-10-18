@@ -1,37 +1,133 @@
 """
-Топологический лосс на основе Soft Euler Characteristic из статьи HyperTopo-Adapters.
+Топологический лосс с Focal Loss и улучшенной балансировкой классов.
 
-Алгоритм из статьи (Algorithm 1):
-1. V(P) = Pi,j · Pi+1,j · Pi,j+1 · Pi+1,j+1 (Soft Vertices)
-2. Eh(P) = Pi,j · Pi,j+1 (Horizontal Edges)
-3. Ev(P) = Pi,j · Pi+1,j (Vertical Edges)
-4. F(P) = Pi,j (Faces/Pixels)
-5. χsoft(P) = Σ(F(P) - Eh(P) - Ev(P) + V(P))
-6. Loss = ||χsoft(P) - χgt||²
-
-Euler characteristic для 2D: χ = β0 - β1 (components - holes)
+Ключевые улучшения:
+1. Focal Loss вместо CE для борьбы с class imbalance
+2. Weighted Multiclass Dice для усиления редких классов
+3. Агрессивные class weights с effective number of samples
+4. Плавное включение топологического лосса
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+import segmentation_models_pytorch as smp
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss для multiclass segmentation.
+    Подавляет легкие примеры (background) и фокусируется на сложных (редкие классы).
+    """
+
+    def __init__(
+        self,
+        alpha: Optional[torch.Tensor] = None,
+        gamma: float = 2.0,
+        reduction: str = 'mean',
+    ):
+        super().__init__()
+        self.alpha = alpha  # Class weights
+        self.gamma = gamma  # Focusing parameter
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: [B, C, H, W] - raw model outputs
+            targets: [B, H, W] - class indices
+        """
+        # Cross entropy loss
+        ce_loss = F.cross_entropy(logits, targets, weight=self.alpha, reduction='none')
+
+        # Get probabilities for true classes
+        probs = F.softmax(logits, dim=1)  # [B, C, H, W]
+        targets_expanded = targets.unsqueeze(1)  # [B, 1, H, W]
+        p_t = torch.gather(probs, 1, targets_expanded).squeeze(1)  # [B, H, W]
+
+        # Focal weight: (1 - p_t)^gamma
+        focal_weight = (1 - p_t) ** self.gamma
+
+        # Apply focal weight
+        focal_loss = focal_weight * ce_loss
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
+class WeightedMulticlassDiceLoss(nn.Module):
+    """
+    Multiclass Dice Loss с весами по классам.
+    Редкие классы получают больший штраф при ошибках.
+    """
+
+    def __init__(
+        self,
+        class_weights: Optional[torch.Tensor] = None,
+        from_logits: bool = True,
+        smooth: float = 1e-5,
+    ):
+        super().__init__()
+        self.class_weights = class_weights
+        self.from_logits = from_logits
+        self.smooth = smooth
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: [B, C, H, W]
+            targets: [B, H, W]
+        """
+        if self.from_logits:
+            probs = F.softmax(logits, dim=1)  # [B, C, H, W]
+        else:
+            probs = logits
+
+        B, C, H, W = probs.shape
+
+        # Convert targets to one-hot: [B, C, H, W]
+        targets_one_hot = F.one_hot(targets, num_classes=C).permute(0, 3, 1, 2).float()
+
+        # Compute Dice per class
+        dice_per_class = []
+        for c in range(C):
+            pred_c = probs[:, c, :, :]  # [B, H, W]
+            target_c = targets_one_hot[:, c, :, :]  # [B, H, W]
+
+            # Flatten spatial dimensions
+            pred_flat = pred_c.view(B, -1)  # [B, H*W]
+            target_flat = target_c.view(B, -1)  # [B, H*W]
+
+            # Dice coefficient
+            intersection = (pred_flat * target_flat).sum(dim=1)  # [B]
+            union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)  # [B]
+
+            dice = (2.0 * intersection + self.smooth) / (union + self.smooth)  # [B]
+            dice_loss = 1.0 - dice.mean()  # Scalar
+
+            dice_per_class.append(dice_loss)
+
+        dice_per_class = torch.stack(dice_per_class)  # [C]
+
+        # Apply class weights
+        if self.class_weights is not None:
+            weighted_dice = (dice_per_class * self.class_weights.to(dice_per_class.device)).sum()
+            weighted_dice = weighted_dice / self.class_weights.sum()
+        else:
+            weighted_dice = dice_per_class.mean()
+
+        return weighted_dice
 
 
 class SoftEulerCharacteristicLoss(nn.Module):
     """
     Soft Euler Characteristic Loss для multiclass segmentation.
-
-    Вычисляет топологический лосс на основе эйлеровой характеристики,
-    что помогает сохранять топологическую структуру (число компонент β0 и дыр β1).
-    Использует дифференцируемую замену бинарных значений на вероятности [0, 1],
-    что позволяет градиентам протекать в веса адаптера (как в статье).
-
-    Args:
-        from_logits: Если True, применяет softmax к входным логитам
-        temperature: Температура для softmax (по умолчанию 1.0)
-        use_squared_loss: Если True, используется L2 loss, иначе L1
-        per_class: Если True, лосс вычисляется для каждого класса отдельно и усредняется
+    (Без изменений из предыдущей версии)
     """
 
     def __init__(
@@ -48,45 +144,20 @@ class SoftEulerCharacteristicLoss(nn.Module):
         self.per_class = per_class
 
     def _compute_euler_characteristic(self, prob_map: torch.Tensor) -> torch.Tensor:
-        """
-        Вычисляет soft Euler characteristic для probability map одной маски.
-
-        Реализация по Algorithm 1 из статьи:
-        χ = Σ(F - Eh - Ev + V), где:
-        - F: faces (пиксели)
-        - Eh: horizontal edges
-        - Ev: vertical edges
-        - V: vertices (углы 2x2)
-
-        Args:
-            prob_map: Tensor shape [B, H, W] с вероятностями [0, 1]
-
-        Returns:
-            Tensor shape [B] со значениями χ для каждого изображения в батче
-        """
-        # prob_map: [B, H, W]
         B, H, W = prob_map.shape
 
         # F(P) = Pi,j (Faces/Pixels)
-        # Для pixel grid: каждый пиксель = face
-        faces = prob_map  # [B, H, W]
-        faces_sum = faces.sum(dim=(1, 2))  # [B]
+        faces_sum = prob_map.sum(dim=(1, 2))  # [B]
 
         # Eh(P) = Pi,j · Pi,j+1 (Horizontal Edges)
-        # Ребро между соседними пикселями по горизонтали
-        # shape: [B, H, W-1]
         horizontal_edges = prob_map[:, :, :-1] * prob_map[:, :, 1:]
         eh_sum = horizontal_edges.sum(dim=(1, 2))  # [B]
 
         # Ev(P) = Pi,j · Pi+1,j (Vertical Edges)
-        # Ребро между соседними пикселями по вертикали
-        # shape: [B, H-1, W]
         vertical_edges = prob_map[:, :-1, :] * prob_map[:, 1:, :]
         ev_sum = vertical_edges.sum(dim=(1, 2))  # [B]
 
         # V(P) = Pi,j · Pi+1,j · Pi,j+1 · Pi+1,j+1 (Soft Vertices)
-        # Вершина = угол 2x2 квадрата
-        # shape: [B, H-1, W-1]
         p00 = prob_map[:, :-1, :-1]
         p10 = prob_map[:, 1:, :-1]
         p01 = prob_map[:, :-1, 1:]
@@ -104,18 +175,7 @@ class SoftEulerCharacteristicLoss(nn.Module):
         logits: torch.Tensor,
         targets: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Вычисляет Soft Euler Characteristic Loss.
-
-        Args:
-            logits: Tensor shape [B, C, H, W] - выходные логиты модели
-            targets: Tensor shape [B, H, W] - ground truth маски с индексами классов [0, C-1]
-
-        Returns:
-            Scalar loss value
-        """
         if self.from_logits:
-            # Применяем softmax с temperature для получения вероятностей
             probs = F.softmax(logits / self.temperature, dim=1)  # [B, C, H, W]
         else:
             probs = logits
@@ -124,20 +184,15 @@ class SoftEulerCharacteristicLoss(nn.Module):
         device = probs.device
 
         if self.per_class:
-            # Вычисляем χ для каждого класса отдельно и усредняем
             total_loss = torch.tensor(0.0, device=device)
 
             for c in range(C):
-                # Predicted probability map для класса c
                 pred_prob = probs[:, c, :, :]  # [B, H, W]
-                # Ground truth binary mask для класса c
                 gt_binary = (targets == c).float()  # [B, H, W]
 
-                # Вычисляем χ для prediction и ground truth
                 chi_pred = self._compute_euler_characteristic(pred_prob)  # [B]
                 chi_gt = self._compute_euler_characteristic(gt_binary)  # [B]
 
-                # Loss = ||χ_pred - χ_gt||² (усредняем по батчу)
                 if self.use_squared_loss:
                     loss_c = torch.mean((chi_pred - chi_gt) ** 2)
                 else:
@@ -145,10 +200,8 @@ class SoftEulerCharacteristicLoss(nn.Module):
 
                 total_loss = total_loss + loss_c
 
-            # Усредняем по классам
             total_loss = total_loss / C
         else:
-            # Альтернативный вариант: вычисляем χ для всей карты сразу (используя argmax)
             pred_argmax = torch.argmax(logits, dim=1).float()  # [B, H, W]
             chi_pred = self._compute_euler_characteristic(pred_argmax)
             chi_gt = self._compute_euler_characteristic(targets.float())
@@ -161,43 +214,29 @@ class SoftEulerCharacteristicLoss(nn.Module):
         return total_loss
 
 
-class WeightedCEDiceTopoLoss(nn.Module):
+class WeightedFocalDiceTopoLoss(nn.Module):
     """
-    Комбинированный лосс: Weighted CrossEntropy + Dice + Topological (Soft Euler Characteristic).
-
-    Объединяет:
-    - CrossEntropy для пиксельной классификации
-    - Dice для работы с дисбалансом классов
-    - Soft Euler Characteristic для сохранения топологической структуры (β0 и β1)
-
-    Как в статье, добавляем warmup: первые N эпох топологический лосс отключен,
-    чтобы позволить сегментационной маске стабилизироваться (см. Figure 8 статьи).
-
-    Args:
-        class_weights: Веса классов для CrossEntropy
-        ce_coef: Коэффициент для CrossEntropy loss
-        dice_coef: Коэффициент для Dice loss
-        topo_coef: Коэффициент для топологического лосса (в статье PH weight)
-        topo_temperature: Температура для softmax в топологическом лоссе
-        topo_warmup_epochs: Количество эпох без топологического лосса (warmup)
+    Улучшенный комбинированный лосс:
+    - Focal Loss (вместо CE) для борьбы с class imbalance
+    - Weighted Multiclass Dice для усиления редких классов
+    - Soft Euler Characteristic для топологии (с плавным включением)
     """
 
     def __init__(
         self,
         class_weights: Optional[torch.Tensor] = None,
-        ce_coef: float = 1.0,
+        focal_gamma: float = 2.0,
+        focal_coef: float = 1.0,
         dice_coef: float = 1.0,
-        topo_coef: float = 0.1,
+        topo_coef: float = 0.005,          # <-- ЕЩЕ МЕНЬШЕ (было 0.01)
         topo_temperature: float = 1.0,
-        topo_warmup_epochs: int = 10,
+        topo_warmup_epochs: int = 15,       # <-- БОЛЬШЕ (было 10)
+        topo_rampup_epochs: int = 15,       # <-- ПЛАВНЕЕ (было 10)
     ):
         super().__init__()
 
-        # Импортируем здесь чтобы избежать circular imports
-        import segmentation_models_pytorch as smp
-
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
-        self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
+        self.focal = FocalLoss(alpha=class_weights, gamma=focal_gamma)
+        self.dice = WeightedMulticlassDiceLoss(class_weights=class_weights)
         self.topo = SoftEulerCharacteristicLoss(
             from_logits=True,
             temperature=topo_temperature,
@@ -205,65 +244,54 @@ class WeightedCEDiceTopoLoss(nn.Module):
             use_squared_loss=True,
         )
 
-        self.ce_coef = ce_coef
+        self.focal_coef = focal_coef
         self.dice_coef = dice_coef
-        self.topo_coef = topo_coef
+        self.max_topo_coef = topo_coef
         self.topo_warmup_epochs = topo_warmup_epochs
+        self.topo_rampup_epochs = topo_rampup_epochs
         self.current_epoch = 0
 
+    def _get_current_topo_coef(self) -> float:
+        """Плавное линейное нарастание веса топологии после warmup."""
+        if self.current_epoch < self.topo_warmup_epochs:
+            return 0.0
+
+        epochs_since_warmup = self.current_epoch - self.topo_warmup_epochs
+        if epochs_since_warmup >= self.topo_rampup_epochs:
+            return self.max_topo_coef
+
+        return self.max_topo_coef * (epochs_since_warmup / self.topo_rampup_epochs)
+
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Вычисляет комбинированный лосс.
-
-        Args:
-            logits: Tensor shape [B, C, H, W] - выходные логиты модели
-            targets: Tensor shape [B, H, W] - ground truth маски
-
-        Returns:
-            Scalar loss value
-        """
-        # Базовые лоссы
-        ce_loss = self.ce(logits, targets)
+        focal_loss = self.focal(logits, targets)
         dice_loss = self.dice(logits, targets)
+        total_loss = self.focal_coef * focal_loss + self.dice_coef * dice_loss
 
-        total_loss = self.ce_coef * ce_loss + self.dice_coef * dice_loss
-
-        # Добавляем топологический лосс ПОСЛЕ warmup (как в статье Figure 8)
-        if self.current_epoch >= self.topo_warmup_epochs:
+        current_topo_coef = self._get_current_topo_coef()
+        if current_topo_coef > 0:
             topo_loss = self.topo(logits, targets)
-            total_loss = total_loss + self.topo_coef * topo_loss
+            total_loss = total_loss + current_topo_coef * topo_loss
 
         return total_loss
 
     def set_epoch(self, epoch: int):
-        """Устанавливает текущую эпоху для warmup логики."""
         self.current_epoch = epoch
 
-    def get_loss_components(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> dict:
-        """
-        Возвращает значения отдельных компонентов лосса для логирования.
-
-        Returns:
-            Dictionary с ключами 'ce', 'dice', 'topo', 'total'
-        """
+    def get_loss_components(self, logits: torch.Tensor, targets: torch.Tensor) -> dict:
         with torch.no_grad():
-            ce_loss = self.ce(logits, targets)
+            focal_loss = self.focal(logits, targets)
             dice_loss = self.dice(logits, targets)
             topo_loss = self.topo(logits, targets)
 
-            total = self.ce_coef * ce_loss + self.dice_coef * dice_loss
-            if self.current_epoch >= self.topo_warmup_epochs:
-                total = total + self.topo_coef * topo_loss
+            current_topo_coef = self._get_current_topo_coef()
+            total = self.focal_coef * focal_loss + self.dice_coef * dice_loss
+            if current_topo_coef > 0:
+                total = total + current_topo_coef * topo_loss
 
             return {
-                'ce': ce_loss.item(),
+                'focal': focal_loss.item(),
                 'dice': dice_loss.item(),
                 'topo': topo_loss.item(),
+                'topo_coef': current_topo_coef,
                 'total': total.item(),
-                'epoch': self.current_epoch,
-                'topo_active': self.current_epoch >= self.topo_warmup_epochs,
             }
