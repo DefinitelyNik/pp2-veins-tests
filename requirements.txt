@@ -3,6 +3,7 @@ pandas
 torch
 numpy
 scikit-learn
+scipy
 Pillow
 albumentations
 segmentation-models-pytorch

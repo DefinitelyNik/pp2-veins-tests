@@ -17,6 +17,7 @@ ModelClass = ImprovedUNetPlusPlus
 USE_FITTED = False
 INTERVAL_METRICS_SAVE_PATH = ModelClass.get_interval_metrics_save_path()
 RAW_METRICS_SAVE_PATH = ModelClass.get_raw_metrics_save_path()
+TRAIN_HISTORY_SAVE_PATH = ModelClass.get_training_history_save_path()
 
 VISUALIZE = True
 VIS_DIR = ModelClass.get_val_viz_path()
@@ -31,8 +32,6 @@ loaders = data_prep.create_cross_val_loaders(
     val_extra_transforms=val_extra_transforms,
 )
 
-# Список val-источников по фолдам — критично, чтобы совпадал
-# с тем, что видел create_cross_val_loaders (тот же SEED)
 val_source_keys_per_fold = data_prep.get_val_source_keys_per_fold()
 assert len(val_source_keys_per_fold) == settings.FOLDS_NUM
 
@@ -45,7 +44,9 @@ if not USE_FITTED:
         zip(models, loaders), start=1
     ):
         print(f"Фолд {i}...")
-        model.fit(train_loader, save_best=True)
+        # ВАЖНО: val_loader теперь передаётся — без него не работает
+        # topology-aware отбор чекпоинта (min Δβ within top-K Dice).
+        model.fit(train_loader, val_loader, save_best=True)
 
         model_save_path = ModelClass.get_model_save_path(i)
         model.save(model_save_path)
@@ -55,6 +56,19 @@ else:
         model_save_path = ModelClass.get_model_save_path(i)
         print(f"Загрузка предобученной модели из {model_save_path}")
         model.load(model_save_path)
+
+# --- ИСТОРИЯ ОБУЧЕНИЯ ---
+TRAIN_HISTORY_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+hist_frames = []
+for i, model in enumerate(models, start=1):
+    h = getattr(model, "history", None)
+    if h:
+        df = pd.DataFrame(h)
+        df.insert(0, "fold", i)
+        hist_frames.append(df)
+if hist_frames:
+    pd.concat(hist_frames, ignore_index=True).to_csv(TRAIN_HISTORY_SAVE_PATH, index=False)
+    print(f"История обучения сохранена в {TRAIN_HISTORY_SAVE_PATH}")
 
 # --- МЕТРИКИ ПО ВОССТАНОВЛЕННЫМ ИЗОБРАЖЕНИЯМ ---
 print("Вычисление метрик по восстановленным изображениям...")

@@ -20,6 +20,7 @@ ModelClass = ImprovedUNetPlusPlus
 USE_FITTED = False
 INTERVAL_METRICS_SAVE_PATH = ModelClass.get_interval_metrics_save_path()
 RAW_METRICS_SAVE_PATH = ModelClass.get_raw_metrics_save_path()
+TRAIN_HISTORY_SAVE_PATH = ModelClass.get_training_history_save_path()
 
 VISUALIZE = True
 VIS_DIR = ModelClass.get_val_viz_path()
@@ -43,7 +44,9 @@ if not USE_FITTED:
         zip(models, loaders), start=1
     ):
         print(f"Фолд {i}...")
-        model.fit(train_loader, save_best=True)
+        # ВАЖНО: val_loader теперь передаётся — без него не работает
+        # topology-aware отбор чекпоинта (min Δβ within top-K Dice).
+        model.fit(train_loader, val_loader, save_best=True)
         save_path = ModelClass.get_model_save_path(i)
         model.save(save_path)
         print(f"Модель сохранена в {save_path}")
@@ -52,6 +55,19 @@ else:
         save_path = ModelClass.get_model_save_path(i)
         print(f"Загрузка предобученной модели из {save_path}")
         model.load(save_path)
+
+# --- ИСТОРИЯ ОБУЧЕНИЯ (loss-компоненты + val Dice/Δβ по эпохам) ---
+TRAIN_HISTORY_SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+hist_frames = []
+for i, model in enumerate(models, start=1):
+    h = getattr(model, "history", None)
+    if h:
+        df = pd.DataFrame(h)
+        df.insert(0, "fold", i)
+        hist_frames.append(df)
+if hist_frames:
+    pd.concat(hist_frames, ignore_index=True).to_csv(TRAIN_HISTORY_SAVE_PATH, index=False)
+    print(f"История обучения сохранена в {TRAIN_HISTORY_SAVE_PATH}")
 
 # --- МЕТРИКИ ПО ПАТЧАМ ---
 print("\n=== Метрики по патчам ===")
