@@ -12,38 +12,29 @@
     0 background, 1 arteries, 2 veins, 3 crossings, 4 capillaries
 
 --------------------------------------------------------------------------
-ЧТО ВАЖНО ЗНАТЬ ПРО ЭТОТ ЛОСС
+ИСПРАВЛЕНИЯ v2 (после анализа коллапса в логах)
 --------------------------------------------------------------------------
-1. χ = V − E + F = β0 − β1 для кубического комплекса (β0 — число компонент
-   связности, β1 — число петель/дыр). Для глазного дна:
-       * β0 капилляров/артерий/вен  -> фрагментация ("confetti")
-       * β1 объединения сосудов     -> замкнутые васкулярные петли
-       * β0 crossings              -> КЛИНИЧЕСКОЕ число AV-перекрёстков
-   Поэтому совпадение χ — содержательный, а не косметический сигнал.
+1. exclude_background=True (ПО УМОЛЧАНИЮ): фон исключён из per-class topo loss.
+   Причина: χ_soft для фона имеет систематическое смещение ~−0.026/pixel при
+   q=0.97, что даёт ~−1700 на патч 256×256 при χ_gt≈0. Это создаёт огромный
+   штраф, который доминирует в лоссе и тянет модель в коллапс.
 
-2. НАИВНАЯ мягкая χ из статьи имеет систематическое смещение. Локальная
-   плотность для равномерного поля вероятности q:
-       χ/pixel = q − 2q² + q⁴ = −q(1−q)(q² + q − 1)
-   При q = 0.97 (типичная уверенность softmax для фона) это −0.0265 на
-   пиксель, т.е. ≈ −1700 на патч 256×256 при ИСТИННОЙ χ ≈ 0.
-   Лосс тогда минимизируется не за счёт топологии, а за счёт "дожима"
-   вероятностей самого массового класса до 1.0 -> модель уходит в фон.
-   Поэтому по умолчанию value_mode="hard": ЗНАЧЕНИЕ χ считается на
-   бинаризованной (argmax) карте (смещения нет), а ГРАДИЕНТ течёт через
-   мягкие вероятности (обучение гладкое).
+2. denom = sqrt(1 + |χ_gt|) вместо (1 + |χ_gt|): более мягкая нормализация,
+   чтобы классы с большой топологией (capillaries: |χ|~50) не были "прощены"
+   за большие абсолютные ошибки, но и не доминировали.
 
-3. Численная устойчивость: прямая сумма F − E_h − E_v + V складывает
-   ~6.5e4 величин порядка 6.5e4, дающих в результате единицы
-   (catastrophic cancellation в float32). Здесь используется идентичная,
-   но ЛОКАЛЬНАЯ 2×2 форма — сокращение происходит внутри каждого окна.
-   Проверено: 0 расхождений на 500 случайных масках.
+3. gradient_mode="ste" по умолчанию: значение и градиент вычисляются в одной
+   точке (straight-through estimator). Устраняет рассинхронизацию между
+   χ_hard (значение) и dχ_soft/dp (градиент), которая была причиной коллапса.
 
-4. Защита от перекоса в один класс (5 механизмов, см. __init__).
+4. absent_class_scale=0.0 по умолчанию: классы, отсутствующие в GT патча,
+   полностью игнорируются в topo loss. Иначе модель учится "не предсказывать
+   редкие классы" (crossings есть только на ~10% патчей).
 --------------------------------------------------------------------------
 """
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -63,39 +54,16 @@ def soft_euler_characteristic(p: torch.Tensor) -> torch.Tensor:
     """
     Дифференцируемая эйлерова характеристика χ = V − E + F = β0 − β1.
 
-    Параметры
-    ---------
-    p : torch.Tensor, (..., H, W), значения в [0, 1]
-        Карта вероятностей (мягкая маска). Для бинарной маски даёт ТОЧНУЮ χ.
-
-    Возвращает
-    ----------
-    torch.Tensor, (...) — χ для каждой карты в батче.
-
-    Математика
-    ----------
-    Прямая форма (статья, Algorithm 1):
-        F  = P_{i,j}                                  (пиксели,   2-клетки)
-        Eh = P_{i,j} * P_{i,j+1}                      (гориз. рёбра, 1-клетки)
-        Ev = P_{i,j} * P_{i+1,j}                      (верт. рёбра,  1-клетки)
-        V  = P_{i,j} P_{i,j+1} P_{i+1,j} P_{i+1,j+1}  (2×2 блоки,  0-клетки)
-        χ  = Σ (F − Eh − Ev + V)
-
-    Здесь — эквивалентная локальная форма. Для 2×2 окна (a=TL, b=TR, c=BL, d=BR):
+    Локальная 2×2 форма (идентична прямой, но численно устойчивее):
         L(a,b,c,d) = ¼(a+b+c+d) − ½(ab+cd+ac+bd) + abcd
         χ = Σ_окна L,   окна бегут по паддингованной нулями карте
-
-    Эквивалентность: каждый пиксель входит в 4 окна (вес 4·¼ = 1 = F),
-    каждое ребро — в 2 окна (вес 2·½ = 1 = E), каждый 2×2 блок — в 1 окно
-    (вес 1 = V). Нулевой паддинг гарантирует, что граничные пиксели/рёбра
-    тоже получают полный вес.
     """
     pp = tF.pad(p, (1, 1, 1, 1), mode="constant", value=0.0)
 
-    a = pp[..., :-1, :-1]   # top-left
-    b = pp[..., :-1, 1:]    # top-right
-    c = pp[..., 1:, :-1]    # bottom-left
-    d = pp[..., 1:, 1:]     # bottom-right
+    a = pp[..., :-1, :-1]  # top-left
+    b = pp[..., :-1, 1:]  # top-right
+    c = pp[..., 1:, :-1]  # bottom-left
+    d = pp[..., 1:, 1:]  # bottom-right
 
     ab = a * b
     cd = c * d
@@ -107,29 +75,18 @@ def soft_euler_characteristic(p: torch.Tensor) -> torch.Tensor:
 
 
 def euler_characteristic_of_index_map(
-    targets: torch.Tensor, num_classes: int
+        targets: torch.Tensor, num_classes: int
 ) -> torch.Tensor:
-    """
-    Точная (бинарная) χ для каждого класса из карты индексов.
-
-    Параметры
-    ---------
-    targets : (B, H, W) int64 — индексы классов
-    num_classes : int
-
-    Возвращает
-    ----------
-    (B, C) float — χ_gt для каждого класса.
-    """
+    """Точная (бинарная) χ для каждого класса из карты индексов."""
     with torch.no_grad():
         t = targets.clamp(min=0, max=num_classes - 1)
-        oh = tF.one_hot(t, num_classes)                    # (B,H,W,C)
-        oh = oh.permute(0, 3, 1, 2).to(torch.float32)      # (B,C,H,W)
+        oh = tF.one_hot(t, num_classes)
+        oh = oh.permute(0, 3, 1, 2).to(torch.float32)
         return soft_euler_characteristic(oh)
 
 
 def _total_variation(p: torch.Tensor) -> torch.Tensor:
-    """TV-регуляризация (статья упоминает её для стабильности обучения)."""
+    """TV-регуляризация для стабильности обучения."""
     dh = (p[..., 1:, :] - p[..., :-1, :]).abs()
     dw = (p[..., :, 1:] - p[..., :, :-1]).abs()
     return dh.mean() + dw.mean()
@@ -143,68 +100,54 @@ class SoftEulerCharacteristicLoss(nn.Module):
     Многоклассовый топологический лосс: |χ_pred − χ_gt| по каждому классу
     + по объединению всего переднего плана.
 
-    Параметры, отвечающие за БАЛАНС КЛАССОВ (главное требование задачи)
-    -------------------------------------------------------------------
-    class_weights        — effective-number веса из `_build_class_weights()`.
-    weight_temperature   — степень, в которую возводятся эти веса.
-                           1.0 = как в CE (crossings могут быть в 200× тяжелее
-                           фона — риск задавить всё остальное);
-                           0.0 = полностью равномерно;
-                           0.5 (default) = sqrt, разумный компромисс.
-                           Веса затем ренормируются к среднему 1.
-    absent_class_scale   — множитель веса для классов, ОТСУТСТВУЮЩИХ в GT
-                           данного патча. 1.0 = считать наравне (тогда лосс
-                           вырождается в "не предсказывай редкие классы");
-                           0.0 = игнорировать;  0.5 (default) — мягкий штраф
-                           за галлюцинации без перекоса.
-    per-sample ренормировка весов — каждый патч даёт одинаковый вклад
-                           независимо от того, какие классы в нём есть.
-    include_union        — отдельный член на χ(весь передний план). Его
-                           НЕЛЬЗЯ удовлетворить, схлопнувшись в один класс:
-                           петли (β1) и связность сети требуют всех классов.
-    Нормировка ошибки    — denom = 1 + |χ_gt| делает ошибки классов
-                           соизмеримыми (|χ_фона| ~ 4, |χ_капилляров| ~ 40).
+    КЛЮЧЕВЫЕ ПАРАМЕТРЫ ДЛЯ БАЛАНСА КЛАССОВ
+    --------------------------------------
+    exclude_background   — исключить фон из per-class topo loss. ПО УМОЛЧАНИЮ
+                           True. Фон имеет систематическое смещение χ_soft и
+                           доминирует в лоссе, вызывая коллапс.
+    weight_temperature   — степень для class_weights. 0.3 (default) даёт
+                           умеренное усиление редких классов (~4× для crossings).
+    absent_class_scale   — множитель веса для классов, отсутствующих в GT.
+                           0.0 (default) = полностью игнорировать. Иначе модель
+                           учится не предсказывать редкие классы.
+    per-sample ренормировка — каждый патч даёт одинаковый вклад.
 
-    Параметры численной устойчивости
-    --------------------------------
-    value_mode="hard"  (default) — значение χ на argmax-карте: нет смещения
-                                   мягкой χ (см. докстринг модуля).
-    value_mode="soft"            — буквально Algorithm 1 из статьи (для
-                                   абляций; требует temperature << 1).
-    gradient_mode="soft" (default) — градиент через мягкие вероятности.
-    gradient_mode="ste"          — straight-through: градиент dχ/dp в точке
-                                   бинарной маски (целочисленный, локальный).
-    rel_clamp          — ограничение относительной ошибки (защита от
-                         взрыва на первых эпохах после warmup).
-    reduction          — "smooth_l1" (default, устойчив к выбросам) или
-                         "l2" (буквально ||χ_soft − χ_gt||² из статьи).
-
-    Warmup (Fig. 8 статьи)
+    ЧИСЛЕННАЯ УСТОЙЧИВОСТЬ
     ----------------------
-    weight_at_epoch(epoch) == 0 первые `warmup_epochs`, затем линейный
-    рост до `weight` за `ramp_epochs`. Даёт Dice/CE стабилизировать маску
-    до включения топологического ограничения.
+    value_mode="soft"    — значение и градиент через мягкие вероятности (согласовано).
+                           Рекомендуется с temperature<1 для острого softmax.
+    value_mode="hard"    — значение на бинарной карте (без смещения), требует
+                           gradient_mode="ste" для согласованного градиента.
+    gradient_mode="soft" — градиент через мягкие вероятности (по умолчанию).
+    gradient_mode="ste"  — straight-through: значение hard, градиент soft в
+                           точке hard (устраняет рассинхронизацию).
+    rel_clamp            — ограничение относительной ошибки (защита от взрыва).
+
+    WARMUP (Fig. 8 статьи)
+    ----------------------
+    weight_at_epoch(epoch) == 0 первые `warmup_epochs`, затем линейный рост.
     """
 
     def __init__(
-        self,
-        num_classes: int,
-        class_weights: Optional[torch.Tensor] = None,
-        weight: float = 0.5,
-        warmup_epochs: int = 10,
-        ramp_epochs: int = 5,
-        value_mode: str = "hard",
-        gradient_mode: str = "soft",
-        temperature: float = 1.0,
-        weight_temperature: float = 0.5,
-        absent_class_scale: float = 0.5,
-        rel_clamp: float = 5.0,
-        reduction: str = "smooth_l1",
-        include_union: bool = True,
-        union_weight: float = 1.0,
-        tv_weight: float = 0.0,
-        background_index: int = 0,
-        eps: float = 1e-8,
+            self,
+            num_classes: int,
+            class_weights: Optional[torch.Tensor] = None,
+            weight: float = 0.5,
+            warmup_epochs: int = 10,
+            ramp_epochs: int = 5,
+            value_mode: str = "soft",  # v2: soft по умолчанию (согласовано)
+            gradient_mode: str = "ste",  # v2: ste по умолчанию (устойчиво)
+            temperature: float = 1.0,
+            weight_temperature: float = 0.3,  # v2: 0.3 вместо 0.5 (умереннее)
+            absent_class_scale: float = 0.0,  # v2: 0.0 вместо 0.5 (не штраф отсутствующих)
+            rel_clamp: float = 1000.0,  # v2: 1000 вместо 5 (не обрезать градиент)
+            reduction: str = "smooth_l1",
+            include_union: bool = True,
+            union_weight: float = 1.0,
+            tv_weight: float = 0.0,
+            background_index: int = 0,
+            exclude_background: bool = True,  # v2: исключить фон из topo loss
+            eps: float = 1e-8,
     ):
         super().__init__()
         assert value_mode in ("hard", "soft"), value_mode
@@ -226,6 +169,7 @@ class SoftEulerCharacteristicLoss(nn.Module):
         self.union_weight = float(union_weight)
         self.tv_weight = float(tv_weight)
         self.background_index = int(background_index)
+        self.exclude_background = bool(exclude_background)
         self.eps = float(eps)
 
         # --- class-balanced веса для топологического члена ---
@@ -240,10 +184,7 @@ class SoftEulerCharacteristicLoss(nn.Module):
         self._last_info: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
-    # warmup / ramp (Fig. 8 статьи)
-    # ------------------------------------------------------------------
     def weight_at_epoch(self, epoch: int) -> float:
-        """`epoch` — 0-based индекс эпохи."""
         if self.weight <= 0.0:
             return 0.0
         if epoch < self.warmup_epochs:
@@ -254,64 +195,48 @@ class SoftEulerCharacteristicLoss(nn.Module):
         return self.weight * float(min(1.0, t))
 
     # ------------------------------------------------------------------
-    # внутреннее
-    # ------------------------------------------------------------------
     def _reduce(self, rel: torch.Tensor) -> torch.Tensor:
         rel = rel.clamp(-self.rel_clamp, self.rel_clamp)
         if self.reduction == "l2":
             return rel.pow(2)
-        # smooth L1 (Huber, beta=1.0): квадратично при |rel|<1, линейно дальше
         return tF.smooth_l1_loss(rel, torch.zeros_like(rel), beta=1.0, reduction="none")
 
     @staticmethod
     def _hard_onehot(probs: torch.Tensor) -> torch.Tensor:
-        idx = probs.argmax(dim=1)                                  # (B,H,W)
-        oh = tF.one_hot(idx, probs.shape[1])                       # (B,H,W,C)
-        return oh.permute(0, 3, 1, 2).to(probs.dtype).contiguous()  # (B,C,H,W)
+        idx = probs.argmax(dim=1)
+        oh = tF.one_hot(idx, probs.shape[1])
+        return oh.permute(0, 3, 1, 2).to(probs.dtype).contiguous()
 
     # ------------------------------------------------------------------
     def forward(
-        self,
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-        return_info: bool = False,
+            self,
+            logits: torch.Tensor,
+            targets: torch.Tensor,
+            return_info: bool = False,
     ):
-        """
-        Параметры
-        ---------
-        logits  : (B, C, H, W) — сырой выход сети
-        targets : (B, H, W)    — int64, индексы классов
-
-        Возвращает
-        ----------
-        loss (0-dim tensor)  либо  (loss, info_dict) если return_info=True.
-        Возвращается НЕВЗВЕШЕННЫЙ лосс — коэффициент по эпохам применяет
-        вызывающий код через `weight_at_epoch`.
-        """
         C = self.num_classes
-        probs = torch.softmax(logits / self.temperature, dim=1)      # (B,C,H,W)
+        probs = torch.softmax(logits / self.temperature, dim=1)
 
         bg = self.background_index
-        fg_soft = 1.0 - probs[:, bg:bg + 1]                          # (B,1,H,W)
+        fg_soft = 1.0 - probs[:, bg:bg + 1]
 
-        # --- мягкие и жёсткие карты (+ канал объединения переднего плана) ---
-        p_soft_all = torch.cat([probs, fg_soft], dim=1)              # (B,C+1,H,W)
+        p_soft_all = torch.cat([probs, fg_soft], dim=1)
         with torch.no_grad():
             oh_hard = self._hard_onehot(probs)
             fg_hard = (oh_hard.argmax(dim=1) != bg).to(probs.dtype).unsqueeze(1)
             p_hard_all = torch.cat([oh_hard, fg_hard], dim=1)
 
-        # --- χ предсказания: значение + путь градиента ---
+        # --- χ предсказания ---
         if self.value_mode == "soft":
             chi_pred_all = soft_euler_characteristic(p_soft_all)
             chi_hard_all = None
         elif self.gradient_mode == "ste":
-            # значение = χ(hard), градиент = dχ/dp|_{hard} · dp_soft
+            # STE: значение = hard, градиент течёт через soft
             p_ste = p_hard_all + (p_soft_all - p_soft_all.detach())
             chi_pred_all = soft_euler_characteristic(p_ste)
             chi_hard_all = None
         else:
-            # значение = χ(hard) (без смещения), градиент = dχ(soft) (гладкий)
+            # value_mode="hard", gradient_mode="soft" (НЕ рекомендуется)
             chi_soft_all = soft_euler_characteristic(p_soft_all)
             with torch.no_grad():
                 chi_hard_all = soft_euler_characteristic(p_hard_all)
@@ -323,21 +248,32 @@ class SoftEulerCharacteristicLoss(nn.Module):
             tgt_oh = tF.one_hot(t, C).permute(0, 3, 1, 2).to(torch.float32)
             tgt_fg = (t != bg).to(torch.float32).unsqueeze(1)
             tgt_all = torch.cat([tgt_oh, tgt_fg], dim=1)
-            chi_gt_all = soft_euler_characteristic(tgt_all)          # (B,C+1)
-            area_gt = tgt_all.sum(dim=(2, 3))                        # (B,C+1)
+            chi_gt_all = soft_euler_characteristic(tgt_all)
+            area_gt = tgt_all.sum(dim=(2, 3))
 
         # ================== per-class член ==================
         chi_pred_c = chi_pred_all[:, :C]
         chi_gt_c = chi_gt_all[:, :C]
 
-        denom_c = 1.0 + chi_gt_c.abs()                     # нормировка по GT
+        # v2: denom = sqrt(1 + |χ_gt|) для более мягкой нормализации
+        denom_c = (1.0 + chi_gt_c.abs()).sqrt()
         rel_c = (chi_pred_c - chi_gt_c) / denom_c
-        per_class = self._reduce(rel_c)                    # (B,C)
+        per_class = self._reduce(rel_c)
 
-        # сбалансированные веса: presence-aware + per-sample ренормировка
-        present = (area_gt[:, :C] > 0).to(per_class.dtype)             # (B,C)
+        # v2: исключить фон из topo loss (главное исправление!)
+        if self.exclude_background and bg < C:
+            per_class[:, bg] = 0.0
+
+        # presence-aware веса + per-sample ренормировка
+        present = (area_gt[:, :C] > 0).to(per_class.dtype)
         presence_mul = present + self.absent_class_scale * (1.0 - present)
-        w_eff = self.class_weights.to(per_class.dtype).unsqueeze(0) * presence_mul
+
+        # v2: если exclude_background, обнулить вес для фона
+        w_class = self.class_weights.to(per_class.dtype).clone()
+        if self.exclude_background and bg < C:
+            w_class[bg] = 0.0
+
+        w_eff = w_class.unsqueeze(0) * presence_mul
         w_eff = w_eff / w_eff.mean(dim=1, keepdim=True).clamp(min=self.eps)
 
         loss_cls = (per_class * w_eff).mean()
@@ -346,7 +282,7 @@ class SoftEulerCharacteristicLoss(nn.Module):
         if self.include_union:
             chi_pred_u = chi_pred_all[:, C]
             chi_gt_u = chi_gt_all[:, C]
-            denom_u = 1.0 + chi_gt_u.abs()
+            denom_u = (1.0 + chi_gt_u.abs()).sqrt()
             rel_u = (chi_pred_u - chi_gt_u) / denom_u
             loss_u = self._reduce(rel_u).mean()
             total = (loss_cls + self.union_weight * loss_u) / (1.0 + self.union_weight)
@@ -372,7 +308,6 @@ class SoftEulerCharacteristicLoss(nn.Module):
                 "topo/loss_cls": float(loss_cls.detach()),
                 "topo/loss_union": float(loss_u.detach()),
                 "topo/tv": float(tv.detach()),
-                # суммарная |Δβ0 − Δβ1| по классам — главная наблюдаемая величина
                 "topo/dchi_abs_cls": float(
                     (chi_val - chi_gt_c).abs().mean()
                 ),
@@ -394,7 +329,8 @@ class SoftEulerCharacteristicLoss(nn.Module):
             f"num_classes={self.num_classes}, weight={self.weight}, "
             f"warmup={self.warmup_epochs}, ramp={self.ramp_epochs}, "
             f"value_mode={self.value_mode}, gradient_mode={self.gradient_mode}, "
-            f"reduction={self.reduction}, weight_temperature={self.weight_temperature}, "
+            f"exclude_background={self.exclude_background}, "
+            f"weight_temperature={self.weight_temperature}, "
             f"absent_class_scale={self.absent_class_scale}, "
             f"include_union={self.include_union}, union_weight={self.union_weight}"
         )

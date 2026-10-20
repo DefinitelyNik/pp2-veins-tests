@@ -21,13 +21,7 @@ from common.topology_metrics import TopologyErrorAccumulator
 NUM_CLASSES = settings.NUM_CLASSES
 
 # ---------------------------------------------------------------------------
-# Бюджет обучения. СОЗНАТЕЛЬНО НЕ ИЗМЕНЁН (см. обоснование в README/PR):
-#   * AdamW + OneCycleLR(div_factor=10) уже даёт LR-warmup ~7 эпох, который
-#     совпадает по фазе с топологическим warmup;
-#   * топологический член нормирован per-class до O(1) и обрезан rel_clamp,
-#     плюс стоит clip_grad_norm=1.0 -> всплесков нормы градиента нет;
-#   * 10 (warmup) + 5 (ramp) = 15 эпох подготовки, остаётся 35 эпох
-#     полноценной топологической регуляризации. Этого достаточно.
+# Бюджет обучения (НЕ ИЗМЕНЁН)
 # ---------------------------------------------------------------------------
 EPOCHS_COUNT = 50
 LEARNING_RATE = 3e-4
@@ -40,29 +34,34 @@ MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
 # ---------------------------------------------------------------------------
-# Гиперпараметры топологического лосса (Soft Euler Characteristic)
+# Гиперпараметры топологического лосса (v2: исправлены после анализа коллапса)
 # ---------------------------------------------------------------------------
-TOPO_WEIGHT = 0.5               # вклад в суммарный лосс (Dice+CE ~ 1.0..1.5)
-TOPO_WARMUP_EPOCHS = 10         # Fig.8 статьи: топология выключена первые 10 эпох
-TOPO_RAMP_EPOCHS = 5            # линейный рост коэффициента после warmup
-TOPO_VALUE_MODE = "hard"        # "hard" = без смещения мягкой χ | "soft" = буква статьи
-TOPO_GRADIENT_MODE = "soft"     # "soft" = гладкий градиент | "ste" = straight-through
-TOPO_TEMPERATURE = 1.0          # <1 обостряет softmax (нужно для value_mode="soft")
-TOPO_WEIGHT_TEMPERATURE = 0.5   # sqrt от CB-весов: редкие классы важнее, но не задавливают
-TOPO_ABSENT_CLASS_SCALE = 0.5   # вес классов, отсутствующих в GT патча
-TOPO_UNION_WEIGHT = 1.0         # вес χ(весь передний план) — анти-коллапс в один класс
-TOPO_REDUCTION = "smooth_l1"    # "smooth_l1" (устойчиво) | "l2" (буквально статья)
-TOPO_REL_CLAMP = 5.0
-TOPO_TV_WEIGHT = 0.0            # TV вреден тонким капиллярам -> по умолчанию выключен
+TOPO_WEIGHT = 0.05              # v2: было 0.5 → очень консервативно
+TOPO_WARMUP_EPOCHS = 20        # v2: было 10 → больше времени на стабилизацию
+TOPO_RAMP_EPOCHS = 10          # v2: было 5 → более плавный рост
+TOPO_VALUE_MODE = "soft"       # v2: "soft" (согласованное значение+градиент)
+TOPO_GRADIENT_MODE = "soft"    # v2: "soft" (для value_mode="soft")
+TOPO_TEMPERATURE = 0.5         # v2: было 1.0 → острее softmax, меньше смещение
+TOPO_WEIGHT_TEMPERATURE = 0.3  # v2: было 0.5 → умеренное усиление редких классов
+TOPO_ABSENT_CLASS_SCALE = 0.0  # v2: было 0.5 → не штрафовать отсутствующие классы
+TOPO_UNION_WEIGHT = 1.0
+TOPO_REDUCTION = "smooth_l1"
+TOPO_REL_CLAMP = 1000.0        # v2: было 5.0 → не обрезать градиент
+TOPO_TV_WEIGHT = 0.0
+
+# v2: защита от коллапса
+ADAPTIVE_TOPO_WEIGHT = True    # автоматически уменьшать вес если Dice падает
+ADAPTIVE_CHECK_EPOCH = 25      # через сколько эпох проверять (после ramp)
+DICE_DROP_THRESHOLD = 0.05     # на сколько может упасть Dice до адаптации
 
 # ---------------------------------------------------------------------------
 # Валидация и отбор чекпоинта
 # ---------------------------------------------------------------------------
-SELECT_BEST_CHECKPOINT = True   # было: сохранялись веса ПОСЛЕДНЕЙ эпохи (save_best игнорировался)
-TOPO_AWARE_SELECTION = True     # "min topo error within top-K Dice" (правило из статьи)
-SELECTION_DICE_TOL = 0.01       # ширина Dice-полосы, внутри которой сравниваем топологию
+SELECT_BEST_CHECKPOINT = True
+TOPO_AWARE_SELECTION = True
+SELECTION_DICE_TOL = 0.01
 VAL_EVERY_EPOCHS = 1
-TOPO_METRICS_IN_VAL = True      # β0/β1 ошибки в валидации (+~3-5 c на эпоху)
+TOPO_METRICS_IN_VAL = True
 
 
 train_extra_transforms = [
@@ -78,10 +77,6 @@ val_extra_transforms = [
 # Losses
 # ===========================================================================
 class WeightedCEDiceLoss(nn.Module):
-    """
-    Weighted CrossEntropy + DiceLoss для multiclass segmentation.
-    CE помогает пиксельной классификации, Dice помогает при сильном дисбалансе классов.
-    """
     def __init__(self, class_weights=None, ce_coef=1.0, dice_coef=1.0):
         super().__init__()
         self.ce = nn.CrossEntropyLoss(weight=class_weights)
@@ -94,16 +89,6 @@ class WeightedCEDiceLoss(nn.Module):
 
 
 class TopoAwareCriterion(nn.Module):
-    """
-    Композитный критерий:  L = L_Dice+wCE  +  w_topo(epoch) * L_SoftEuler
-
-    `w_topo(epoch)` растёт от 0 до TOPO_WEIGHT после warmup — это важно,
-    потому что мягкая эйлерова характеристика на ненасыщенном softmax
-    содержит сильное смещение, и включать её с первой эпохи нельзя.
-
-    forward() возвращает (loss, info_dict).
-    """
-
     def __init__(
         self,
         class_weights: torch.Tensor,
@@ -143,6 +128,7 @@ class TopoAwareCriterion(nn.Module):
             union_weight=union_weight,
             tv_weight=tv_weight,
             background_index=0,
+            exclude_background=True,  # v2: исключить фон
         )
 
     def weight_at_epoch(self, epoch: int) -> float:
@@ -151,10 +137,8 @@ class TopoAwareCriterion(nn.Module):
     def forward(self, logits, targets, epoch: Optional[int] = None):
         seg_loss = self.seg(logits, targets)
         topo_loss, topo_info = self.topo(logits, targets, return_info=True)
-
         w = self.topo.weight if epoch is None else self.weight_at_epoch(epoch)
         total = seg_loss + w * topo_loss
-
         info = {
             "loss_total": float(total.detach()),
             "loss_seg": float(seg_loss.detach()),
@@ -170,7 +154,6 @@ class TopoAwareCriterion(nn.Module):
 # ===========================================================================
 def _class_stats_update(preds: np.ndarray, targets: np.ndarray,
                         num_classes: int, stats: np.ndarray) -> None:
-    """stats: (C, 3) -> TP, FP, FN"""
     for c in range(num_classes):
         p = (preds == c)
         t = (targets == c)
@@ -203,7 +186,6 @@ class ImprovedUNetPlusPlus(BaseModel):
         class_weights = self._build_class_weights().to(settings.DEVICE)
         self.class_weights = class_weights
 
-        # --- Композитный критерий: Dice+wCE  +  Soft Euler Characteristic ---
         self.criterion = TopoAwareCriterion(class_weights=class_weights)
         print(f"[topo] {self.criterion.topo}")
 
@@ -220,16 +202,11 @@ class ImprovedUNetPlusPlus(BaseModel):
     # ------------------------------------------------------------------
     def _build_class_weights(self) -> torch.Tensor:
         print(f'Building class weights')
-        """
-        Считаем частоты классов в train для диагностики дисбаланса.
-        Подготовку данных и pipeline не меняем.
-        """
         mask_paths = sorted(settings.TRAIN_MASK_DIR.glob("*.png"))
         class_counts = np.zeros(NUM_CLASSES, dtype=np.float64)
-
         color_map = {k: np.array(v, dtype=np.uint8) for k, v in settings.COLOR_MAP.items()}
 
-        for i, mask_path in enumerate(mask_paths, start=1):
+        for mask_path in mask_paths:
             mask_rgb = np.array(Image.open(mask_path).convert("RGB"))
             mask_labels = np.zeros(mask_rgb.shape[:2], dtype=np.uint8)
             for class_idx, color in color_map.items():
@@ -243,9 +220,6 @@ class ImprovedUNetPlusPlus(BaseModel):
         weights = weights / weights.mean()
         print(f'Weights are built: '
               f'{ {settings.CLASS_NAMES[i]: round(float(weights[i]), 4) for i in range(NUM_CLASSES)} }')
-        print(f'[topo] веса топологического лосса (после sqrt-темперирования): '
-              f'{ {settings.CLASS_NAMES[i]: round(float(w), 4) for i, w in enumerate(self.criterion.topo.class_weights.tolist())} }'
-              if hasattr(self, "criterion") else "")
         return torch.tensor(weights, dtype=torch.float32)
 
     def _ensure_scheduler(self, train_loader_len: int) -> None:
@@ -280,11 +254,6 @@ class ImprovedUNetPlusPlus(BaseModel):
 
     @torch.no_grad()
     def _validate(self, val_loader) -> Dict[str, float]:
-        """
-        Macro Dice/IoU + точные топологические ошибки (Δβ0, Δβ1, Δχ).
-        Топология считается ТОЧНО на бинарных масках (scipy), а не через
-        мягкую χ — это независимая от лосса мера качества.
-        """
         was_training = self.model.training
         self.model.eval()
 
@@ -325,18 +294,22 @@ class ImprovedUNetPlusPlus(BaseModel):
             save_best: bool = True, patience=None, **kwargs):
 
         print(f'Start fitting')
-        print(f'[topo] value_mode={TOPO_VALUE_MODE}, gradient_mode={TOPO_GRADIENT_MODE}, '
-              f'weight={TOPO_WEIGHT}, warmup={TOPO_WARMUP_EPOCHS}, ramp={TOPO_RAMP_EPOCHS}')
+        print(f'[topo v2] value_mode={TOPO_VALUE_MODE}, gradient_mode={TOPO_GRADIENT_MODE}, '
+              f'weight={TOPO_WEIGHT}, warmup={TOPO_WARMUP_EPOCHS}, ramp={TOPO_RAMP_EPOCHS}, '
+              f'temperature={TOPO_TEMPERATURE}, exclude_background=True')
 
         self._ensure_scheduler(len(train_loader))
         self.history = []
 
-        # --- состояние для отбора лучшего чекпоинта ---
         best_dice = -1.0
         best_state_dice: Optional[Dict[str, torch.Tensor]] = None
         band_topo = float("inf")
         band_dice = -1.0
         band_state: Optional[Dict[str, torch.Tensor]] = None
+
+        # v2: для adaptive weight adjustment
+        pre_topo_dice: Optional[float] = None
+        adaptive_applied = False
 
         start = time.time()
         for epoch in range(EPOCHS_COUNT):
@@ -388,6 +361,23 @@ class ImprovedUNetPlusPlus(BaseModel):
                 record.update(vm)
                 v_dice = vm["val_macro_dice"]
                 v_topo = vm["val_topo_error"]
+
+                # v2: запомнить Dice в конце warmup (перед включением topo)
+                if epoch == TOPO_WARMUP_EPOCHS - 1:
+                    pre_topo_dice = v_dice
+                    print(f"[topo v2] Запомнил Dice перед topo: {pre_topo_dice:.4f}")
+
+                # v2: adaptive weight adjustment
+                if (ADAPTIVE_TOPO_WEIGHT and not adaptive_applied
+                    and epoch == ADAPTIVE_CHECK_EPOCH - 1 and pre_topo_dice is not None):
+                    dice_drop = pre_topo_dice - v_dice
+                    if dice_drop > DICE_DROP_THRESHOLD:
+                        old_weight = self.criterion.topo.weight
+                        self.criterion.topo.weight *= 0.5
+                        print(f"[topo v2] ⚠️ Dice упал на {dice_drop:.3f} "
+                              f"(с {pre_topo_dice:.4f} до {v_dice:.4f}). "
+                              f"Уменьшаю topo_weight: {old_weight:.3f} → {self.criterion.topo.weight:.3f}")
+                        adaptive_applied = True
 
                 if SELECT_BEST_CHECKPOINT:
                     if v_dice > best_dice:
@@ -441,7 +431,6 @@ class ImprovedUNetPlusPlus(BaseModel):
         return preds.cpu()
 
     def predict_logits(self, images: torch.Tensor) -> torch.Tensor:
-        """Логиты (для отладки топологического лосса)."""
         self.model.eval()
         with torch.no_grad():
             images = images.to(settings.DEVICE, non_blocking=True)
@@ -466,6 +455,7 @@ class ImprovedUNetPlusPlus(BaseModel):
                 "absent_class_scale": TOPO_ABSENT_CLASS_SCALE,
                 "union_weight": TOPO_UNION_WEIGHT,
                 "reduction": TOPO_REDUCTION,
+                "exclude_background": True,
             },
         }, path)
 
@@ -499,7 +489,7 @@ class ImprovedUNetPlusPlus(BaseModel):
 
     @staticmethod
     def get_model_name():
-        return 'UNET-WCD-TOPO'
+        return 'UNET-WCD-TOPO-v2'
 
     @staticmethod
     def get_val_viz_path() -> pathlib.Path:
