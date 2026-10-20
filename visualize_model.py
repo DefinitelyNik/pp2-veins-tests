@@ -27,7 +27,7 @@ from common.data_preparation_patches import get_val_source_keys_per_fold
 
 
 # ─── Настройки ──────────────────────────────────────────────────────────────────
-WEIGHTS_PATH = pathlib.Path("UNETPP_WCD/weights_1_patches.pth")
+WEIGHTS_PATH = pathlib.Path("UNETPP_WCD/weights_1_patches_topo_v3.pth")
 OUTPUT_DIR = pathlib.Path("UNETPP_WCD/visualizations")
 
 NUM_CLASSES = settings.NUM_CLASSES

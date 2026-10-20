@@ -129,25 +129,27 @@ class SoftEulerCharacteristicLoss(nn.Module):
     """
 
     def __init__(
-            self,
-            num_classes: int,
-            class_weights: Optional[torch.Tensor] = None,
-            weight: float = 0.5,
-            warmup_epochs: int = 10,
-            ramp_epochs: int = 5,
-            value_mode: str = "soft",  # v2: soft по умолчанию (согласовано)
-            gradient_mode: str = "ste",  # v2: ste по умолчанию (устойчиво)
-            temperature: float = 1.0,
-            weight_temperature: float = 0.3,  # v2: 0.3 вместо 0.5 (умереннее)
-            absent_class_scale: float = 0.0,  # v2: 0.0 вместо 0.5 (не штраф отсутствующих)
-            rel_clamp: float = 1000.0,  # v2: 1000 вместо 5 (не обрезать градиент)
-            reduction: str = "smooth_l1",
-            include_union: bool = True,
-            union_weight: float = 1.0,
-            tv_weight: float = 0.0,
-            background_index: int = 0,
-            exclude_background: bool = True,  # v2: исключить фон из topo loss
-            eps: float = 1e-8,
+        self,
+        num_classes: int,
+        class_weights: Optional[torch.Tensor] = None,
+        weight: float = 0.1,                # v3: было 0.05 → увеличено
+        warmup_epochs: int = 20,
+        ramp_epochs: int = 10,
+        value_mode: str = "soft",
+        gradient_mode: str = "soft",
+        temperature: float = 0.5,
+        weight_temperature: float = 0.5,    # v3: было 0.3 → сильнее для редких
+        absent_class_scale: float = 0.1,    # v3: было 0.0 → учить редкие классы
+        rel_clamp: float = 1000.0,
+        reduction: str = "smooth_l1",
+        include_union: bool = True,
+        union_weight: float = 1.0,
+        tv_weight: float = 0.05,            # v3: было 0.0 → TV для гладкости
+        boundary_weight: float = 0.05,      # v3: новое — boundary loss
+        connectivity_weight: float = 0.02,  # v3: новое — connectivity penalty
+        background_index: int = 0,
+        exclude_background: bool = True,
+        eps: float = 1e-8,
     ):
         super().__init__()
         assert value_mode in ("hard", "soft"), value_mode
@@ -168,11 +170,13 @@ class SoftEulerCharacteristicLoss(nn.Module):
         self.include_union = bool(include_union)
         self.union_weight = float(union_weight)
         self.tv_weight = float(tv_weight)
+        self.boundary_weight = float(boundary_weight)
+        self.connectivity_weight = float(connectivity_weight)
         self.background_index = int(background_index)
         self.exclude_background = bool(exclude_background)
         self.eps = float(eps)
 
-        # --- class-balanced веса для топологического члена ---
+        # --- class-balanced веса ---
         if class_weights is None:
             w = torch.ones(self.num_classes, dtype=torch.float32)
         else:
@@ -180,6 +184,15 @@ class SoftEulerCharacteristicLoss(nn.Module):
         w = w.pow(self.weight_temperature)
         w = w / w.mean().clamp(min=self.eps)
         self.register_buffer("class_weights", w)
+
+        # v3: дополнительные регуляризаторы
+        self.tv_reg = TVRegularizer(weight=tv_weight)
+        self.boundary_loss = BoundaryLoss(num_classes, weight=boundary_weight)
+        self.connectivity_reg = ConnectivityRegularizer(
+            num_classes,
+            weight=connectivity_weight,
+            background_index=background_index,
+        )
 
         self._last_info: Dict[str, float] = {}
 
@@ -231,12 +244,10 @@ class SoftEulerCharacteristicLoss(nn.Module):
             chi_pred_all = soft_euler_characteristic(p_soft_all)
             chi_hard_all = None
         elif self.gradient_mode == "ste":
-            # STE: значение = hard, градиент течёт через soft
             p_ste = p_hard_all + (p_soft_all - p_soft_all.detach())
             chi_pred_all = soft_euler_characteristic(p_ste)
             chi_hard_all = None
         else:
-            # value_mode="hard", gradient_mode="soft" (НЕ рекомендуется)
             chi_soft_all = soft_euler_characteristic(p_soft_all)
             with torch.no_grad():
                 chi_hard_all = soft_euler_characteristic(p_hard_all)
@@ -255,20 +266,16 @@ class SoftEulerCharacteristicLoss(nn.Module):
         chi_pred_c = chi_pred_all[:, :C]
         chi_gt_c = chi_gt_all[:, :C]
 
-        # v2: denom = sqrt(1 + |χ_gt|) для более мягкой нормализации
         denom_c = (1.0 + chi_gt_c.abs()).sqrt()
         rel_c = (chi_pred_c - chi_gt_c) / denom_c
         per_class = self._reduce(rel_c)
 
-        # v2: исключить фон из topo loss (главное исправление!)
         if self.exclude_background and bg < C:
             per_class[:, bg] = 0.0
 
-        # presence-aware веса + per-sample ренормировка
         present = (area_gt[:, :C] > 0).to(per_class.dtype)
         presence_mul = present + self.absent_class_scale * (1.0 - present)
 
-        # v2: если exclude_background, обнулить вес для фона
         w_class = self.class_weights.to(per_class.dtype).clone()
         if self.exclude_background and bg < C:
             w_class[bg] = 0.0
@@ -290,12 +297,12 @@ class SoftEulerCharacteristicLoss(nn.Module):
             loss_u = torch.zeros((), device=logits.device, dtype=logits.dtype)
             total = loss_cls
 
-        # ================== опциональный TV ==================
-        if self.tv_weight > 0.0:
-            tv = _total_variation(p_soft_all)
-            total = total + self.tv_weight * tv
-        else:
-            tv = torch.zeros((), device=logits.device, dtype=logits.dtype)
+        # ================== v3: дополнительные регуляризаторы ==================
+        tv = self.tv_reg(probs)
+        boundary = self.boundary_loss(logits, targets)
+        connectivity = self.connectivity_reg(logits, targets)
+
+        total = total + tv + boundary + connectivity
 
         # ================== диагностика ==================
         with torch.no_grad():
@@ -308,6 +315,8 @@ class SoftEulerCharacteristicLoss(nn.Module):
                 "topo/loss_cls": float(loss_cls.detach()),
                 "topo/loss_union": float(loss_u.detach()),
                 "topo/tv": float(tv.detach()),
+                "topo/boundary": float(boundary.detach()),
+                "topo/connectivity": float(connectivity.detach()),
                 "topo/dchi_abs_cls": float(
                     (chi_val - chi_gt_c).abs().mean()
                 ),
@@ -332,5 +341,172 @@ class SoftEulerCharacteristicLoss(nn.Module):
             f"exclude_background={self.exclude_background}, "
             f"weight_temperature={self.weight_temperature}, "
             f"absent_class_scale={self.absent_class_scale}, "
+            f"tv_weight={self.tv_weight}, boundary_weight={self.boundary_weight}, "
+            f"connectivity_weight={self.connectivity_weight}, "
             f"include_union={self.include_union}, union_weight={self.union_weight}"
         )
+
+
+# ===========================================================================
+# ДОПОЛНИТЕЛЬНЫЕ КОМПОНЕНТЫ ЛОССА (v3: улучшение границ и связности)
+# ===========================================================================
+class TVRegularizer(nn.Module):
+    """
+    Total Variation regularization: штрафует за резкие изменения вероятностей
+    между соседними пикселями. Сглаживает "шершавые" границы.
+
+    TV = Σ|p[i,j+1] - p[i,j]| + Σ|p[i+1,j] - p[i,j]|
+    """
+
+    def __init__(self, weight: float = 0.05):
+        super().__init__()
+        self.weight = float(weight)
+
+    def forward(self, probs: torch.Tensor) -> torch.Tensor:
+        """probs: (B, C, H, W) — вероятности после softmax"""
+        if self.weight <= 0.0:
+            return torch.zeros((), device=probs.device, dtype=probs.dtype)
+
+        # Горизонтальные градиенты
+        dh = (probs[:, :, :, 1:] - probs[:, :, :, :-1]).abs().mean()
+        # Вертикальные градиенты
+        dv = (probs[:, :, 1:, :] - probs[:, :, :-1, :]).abs().mean()
+
+        return self.weight * (dh + dv)
+
+
+class BoundaryLoss(nn.Module):
+    """
+    Boundary-aware Dice loss: штрафует за неточности на границах классов.
+    Использует лапласиан для определения границ в GT и предсказании.
+
+    Помогает с "шершавыми" границами и улучшает точность контуров.
+    """
+
+    def __init__(self, num_classes: int, weight: float = 0.05):
+        super().__init__()
+        self.num_classes = num_classes
+        self.weight = float(weight)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        logits: (B, C, H, W)
+        targets: (B, H, W) int64
+        """
+        if self.weight <= 0.0:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        B, C, H, W = logits.shape
+        probs = torch.softmax(logits, dim=1)
+
+        # Лапласиан для определения границ
+        def detect_boundary(x: torch.Tensor) -> torch.Tensor:
+            """x: (B, C, H, W) -> boundary mask (B, H, W)"""
+            pad_x = tF.pad(x, (1, 1, 1, 1), mode='constant', value=0.0)
+            center = pad_x[:, :, 1:-1, 1:-1]
+            up = pad_x[:, :, :-2, 1:-1]
+            down = pad_x[:, :, 2:, 1:-1]
+            left = pad_x[:, :, 1:-1, :-2]
+            right = pad_x[:, :, 1:-1, 2:]
+            lap = (4 * center - up - down - left - right).abs()
+            # Максимум по классам = граница
+            return lap.max(dim=1)[0]  # (B, H, W)
+
+        # Границы в GT
+        with torch.no_grad():
+            t = targets.clamp(min=0, max=C - 1)
+            tgt_oh = tF.one_hot(t, C).permute(0, 3, 1, 2).float()
+            tgt_boundary = detect_boundary(tgt_oh)
+            # Бинаризация: граница если лапласиан > 0.3
+            tgt_boundary = (tgt_boundary > 0.3).float()
+
+        # Границы в предсказании
+        pred_boundary = detect_boundary(probs)
+
+        # Dice на границах
+        eps = 1e-8
+        intersection = (pred_boundary * tgt_boundary).sum()
+        union = pred_boundary.sum() + tgt_boundary.sum() + eps
+        dice = 2.0 * intersection / union
+        loss = 1.0 - dice
+
+        return self.weight * loss
+
+
+class ConnectivityRegularizer(nn.Module):
+    """
+    Штрафует за избыточное количество компонент связности (β0) в предсказании.
+    Помогает с разрывами в длинных сосудах.
+
+    Эвристика: если в GT длинный связный объект, а предсказание разбило его
+    на много мелких фрагментов — штраф.
+
+    Использует мягкую χ (число компонент ≈ χ для тонких структур).
+    """
+
+    def __init__(
+            self,
+            num_classes: int,
+            weight: float = 0.02,
+            background_index: int = 0,
+            exclude_classes: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.weight = float(weight)
+        self.background_index = background_index
+        # Исключаем фон и crossings (они по природе фрагментированы)
+        self.exclude_classes = set(exclude_classes or [background_index, 3])
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        logits: (B, C, H, W)
+        targets: (B, H, W) int64
+        """
+        if self.weight <= 0.0:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        probs = torch.softmax(logits, dim=1)
+        B, C, H, W = probs.shape
+
+        total_penalty = 0.0
+        count = 0
+
+        for c in range(C):
+            if c in self.exclude_classes:
+                continue
+
+            # Маска класса c в GT
+            with torch.no_grad():
+                tgt_mask = (targets == c).float()  # (B, H, W)
+                if tgt_mask.sum() < 100:  # слишком мало пикселей — пропускаем
+                    continue
+
+            # Мягкая маска в предсказании
+            pred_soft = probs[:, c]  # (B, H, W)
+
+            # χ для предсказания (число компонент ≈ χ для тонких структур)
+            chi_pred = soft_euler_characteristic(pred_soft)  # (B,)
+
+            # χ для GT
+            with torch.no_grad():
+                chi_gt = soft_euler_characteristic(tgt_mask)  # (B,)
+
+            # Штраф если χ_pred << χ_gt (слишком много компонент)
+            # β0 = χ для тонких структур, поэтому χ_pred < χ_gt = фрагментация
+            # Используем smooth L1 для устойчивости
+            diff = chi_gt - chi_pred  # положительное = фрагментация
+            penalty = tF.smooth_l1_loss(
+                diff.clamp(min=0),
+                torch.zeros_like(diff),
+                beta=1.0,
+                reduction='mean'
+            )
+
+            total_penalty += penalty
+            count += 1
+
+        if count == 0:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        return self.weight * (total_penalty / count)

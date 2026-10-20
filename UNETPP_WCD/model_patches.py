@@ -34,25 +34,27 @@ MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
 # ---------------------------------------------------------------------------
-# Гиперпараметры топологического лосса (v2: исправлены после анализа коллапса)
+# Гиперпараметры топологического лосса (v3: улучшение границ и связности)
 # ---------------------------------------------------------------------------
-TOPO_WEIGHT = 0.05              # v2: было 0.5 → очень консервативно
-TOPO_WARMUP_EPOCHS = 20        # v2: было 10 → больше времени на стабилизацию
-TOPO_RAMP_EPOCHS = 10          # v2: было 5 → более плавный рост
-TOPO_VALUE_MODE = "soft"       # v2: "soft" (согласованное значение+градиент)
-TOPO_GRADIENT_MODE = "soft"    # v2: "soft" (для value_mode="soft")
-TOPO_TEMPERATURE = 0.5         # v2: было 1.0 → острее softmax, меньше смещение
-TOPO_WEIGHT_TEMPERATURE = 0.3  # v2: было 0.5 → умеренное усиление редких классов
-TOPO_ABSENT_CLASS_SCALE = 0.0  # v2: было 0.5 → не штрафовать отсутствующие классы
+TOPO_WEIGHT = 0.1                 # v3: было 0.05 → сильнее топологическое давление
+TOPO_WARMUP_EPOCHS = 20
+TOPO_RAMP_EPOCHS = 10
+TOPO_VALUE_MODE = "soft"
+TOPO_GRADIENT_MODE = "soft"
+TOPO_TEMPERATURE = 0.5
+TOPO_WEIGHT_TEMPERATURE = 0.5    # v3: было 0.3 → сильнее для редких классов (capillaries)
+TOPO_ABSENT_CLASS_SCALE = 0.1    # v3: было 0.0 → учить предсказывать редкие классы
 TOPO_UNION_WEIGHT = 1.0
 TOPO_REDUCTION = "smooth_l1"
-TOPO_REL_CLAMP = 1000.0        # v2: было 5.0 → не обрезать градиент
-TOPO_TV_WEIGHT = 0.0
+TOPO_REL_CLAMP = 1000.0
+TOPO_TV_WEIGHT = 0.05            # v3: новое — TV для гладких границ
+TOPO_BOUNDARY_WEIGHT = 0.05      # v3: новое — boundary loss
+TOPO_CONNECTIVITY_WEIGHT = 0.02  # v3: новое — connectivity penalty
 
-# v2: защита от коллапса
-ADAPTIVE_TOPO_WEIGHT = True    # автоматически уменьшать вес если Dice падает
-ADAPTIVE_CHECK_EPOCH = 25      # через сколько эпох проверять (после ramp)
-DICE_DROP_THRESHOLD = 0.05     # на сколько может упасть Dice до адаптации
+# v2: защита от коллапса (остаётся)
+ADAPTIVE_TOPO_WEIGHT = True
+ADAPTIVE_CHECK_EPOCH = 25
+DICE_DROP_THRESHOLD = 0.05
 
 # ---------------------------------------------------------------------------
 # Валидация и отбор чекпоинта
@@ -294,9 +296,13 @@ class ImprovedUNetPlusPlus(BaseModel):
             save_best: bool = True, patience=None, **kwargs):
 
         print(f'Start fitting')
-        print(f'[topo v2] value_mode={TOPO_VALUE_MODE}, gradient_mode={TOPO_GRADIENT_MODE}, '
+        print(f'[topo v3] value_mode={TOPO_VALUE_MODE}, gradient_mode={TOPO_GRADIENT_MODE}, '
               f'weight={TOPO_WEIGHT}, warmup={TOPO_WARMUP_EPOCHS}, ramp={TOPO_RAMP_EPOCHS}, '
               f'temperature={TOPO_TEMPERATURE}, exclude_background=True')
+        print(f'[topo v3] Новые компоненты: TV={TOPO_TV_WEIGHT}, Boundary={TOPO_BOUNDARY_WEIGHT}, '
+              f'Connectivity={TOPO_CONNECTIVITY_WEIGHT}')
+        print(f'[topo v3] Усиленные веса: weight_temperature={TOPO_WEIGHT_TEMPERATURE}, '
+              f'absent_class_scale={TOPO_ABSENT_CLASS_SCALE}')
 
         self._ensure_scheduler(len(train_loader))
         self.history = []
