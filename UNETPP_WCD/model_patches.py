@@ -21,15 +21,7 @@ from common.topology_metrics import TopologyErrorAccumulator
 NUM_CLASSES = settings.NUM_CLASSES
 
 # ---------------------------------------------------------------------------
-# Бюджет обучения
-# ---------------------------------------------------------------------------
-# ЭПОХИ: 70 вместо 50. ОБОСНОВАНИЕ:
-#   - 20 эпох warmup + 10 эпох ramp = 30 эпох подготовки
-#   - При 50 эпохах остаётся только 20 эпох полного обучения с топологией
-#   - При 70 эпохах остаётся 40 эпох — вдвое больше
-#   - В логах v2 видно, что модель ещё улучшалась на эпохе 50
-#   - LR и оптимизатор НЕ меняются: OneCycleLR автоматически масштабируется
-#     на новое число эпох, а топологический лосс нормирован до O(1)
+# Бюджет обучения — 50 эпох для сравнимости. НЕ меняем.
 # ---------------------------------------------------------------------------
 EPOCHS_COUNT = 50
 LEARNING_RATE = 3e-4
@@ -42,29 +34,56 @@ MEAN = (0.485, 0.456, 0.406)
 STD = (0.229, 0.224, 0.225)
 
 # ---------------------------------------------------------------------------
-# Гиперпараметры топологического лосса (v4: откат к v2)
+# v5: схема весов классов.
+#
+# ДИАГНОСТИКА, КОТОРУЮ ЭТО ЧИНИТ:
+#   Веса v4 (sqrt обратной частоты): bg 0.08, art 0.34, veins 0.31, ...
+#   В CE вес применяется к ЦЕЛЕВОМУ классу пикселя, поэтому ошибка
+#   "сосуд на фоне" штрафовалась весом фона 0.08 -> утечка сосудов:
+#       arteries_precision 0.835 -> 0.785,  veins_precision 0.865 -> 0.826,
+#       background_recall 0.9909 -> 0.9865.
+#   Одновременно весь CE ослаб в ~9 раз (sum(freq*w) = 0.11 вместо 1.0).
+#
+# НОВАЯ СХЕМА: (1/freq) ** 0.15, кламп [0.4, 3.0], нормировка к среднему 1:
+#   частоты:  bg 0.8889, art 0.0493, veins 0.0588, cross 0.0021, cap 0.0008
+#   веса:     bg 0.53,   art 0.82,   veins 0.80,   cross 1.32,   cap 1.53
+#   - фон возвращён до 0.53 -> утечки снова дорого штрафуются (precision);
+#   - артерии/вены ~1.0 -> приоритет задачи;
+#   - кроссинги/капилляры умеренно усилены (без экстремума 2.6 из v4).
 # ---------------------------------------------------------------------------
-TOPO_WEIGHT = 0.05               # v4: откат к v2 (было 0.1 в v3)
+CLASS_WEIGHT_POWER = 0.15
+CLASS_WEIGHT_MIN = 0.4
+CLASS_WEIGHT_MAX = 3.0
+
+# ---------------------------------------------------------------------------
+# Гиперпараметры топологического лосса — БЕЗ ИЗМЕНЕНИЙ (стабильно в v2/v4)
+# ---------------------------------------------------------------------------
+TOPO_WEIGHT = 0.05
 TOPO_WARMUP_EPOCHS = 20
 TOPO_RAMP_EPOCHS = 10
 TOPO_VALUE_MODE = "soft"
 TOPO_GRADIENT_MODE = "soft"
 TOPO_TEMPERATURE = 0.5
-TOPO_WEIGHT_TEMPERATURE = 0.3    # v4: откат к v2 (было 0.5 в v3)
-TOPO_ABSENT_CLASS_SCALE = 0.0    # v4: откат к v2 (было 0.1 в v3)
+TOPO_WEIGHT_TEMPERATURE = 0.3
+TOPO_ABSENT_CLASS_SCALE = 0.0
 TOPO_UNION_WEIGHT = 1.0
 TOPO_REDUCTION = "smooth_l1"
 TOPO_REL_CLAMP = 1000.0
-TOPO_TV_WEIGHT = 0.0             # v4: выключено (было 0.05 в v3)
+TOPO_TV_WEIGHT = 0.0
 
-# v2: защита от коллапса
+# ---------------------------------------------------------------------------
+# v5: штраф за путаницу артерия <-> вена
+# ---------------------------------------------------------------------------
+CONFUSION_WEIGHT = 0.2
+CONFUSION_ARTERY_IDX = 1
+CONFUSION_VEIN_IDX = 2
+
+# Защита от коллапса
 ADAPTIVE_TOPO_WEIGHT = True
-ADAPTIVE_CHECK_EPOCH = 25     
+ADAPTIVE_CHECK_EPOCH = 25
 DICE_DROP_THRESHOLD = 0.05
 
-# ---------------------------------------------------------------------------
 # Валидация и отбор чекпоинта
-# ---------------------------------------------------------------------------
 SELECT_BEST_CHECKPOINT = True
 TOPO_AWARE_SELECTION = True
 SELECTION_DICE_TOL = 0.01
@@ -100,9 +119,62 @@ class WeightedCEDiceLoss(nn.Module):
         return self.ce_coef * self.ce(logits, targets) + self.dice_coef * self.dice(logits, targets)
 
 
+class ArteryVeinConfusionLoss(nn.Module):
+    """
+    v5: целевой штраф за путаницу артерия <-> вена.
+
+    Мотивация: на визуализациях вдоль сосуда встречаются небольшие области,
+    где артерия помечена как вена и наоборот, хотя пересечения там нет.
+    Обычный CE почти не давит на такие места, когда модель "почти уверена"
+    (например, p_artery = 0.9, p_vein = 0.08 -> -log(0.9) уже мал), а макрософтовый
+    Dice эту локальную подмену не видит.
+
+    Лосс напрямую минимизирует вероятность "соседнего" класса на пикселях
+    истинного сосуда:
+
+        L = 0.5 * ( mean_{p: GT=artery} P_vein(p)  +  mean_{p: GT=vein} P_artery(p) )
+
+    Свойства:
+      * диапазон [0, 1], 0 = путаницы нет;
+      * НЕ затрагивает фон, кроссинги и капилляры;
+      * дифференцируем, работает с эпохи 0 (это пиксельный член, как CE, —
+        топологический warmup ему не нужен).
+    """
+
+    def __init__(
+        self,
+        weight: float = CONFUSION_WEIGHT,
+        artery_idx: int = CONFUSION_ARTERY_IDX,
+        vein_idx: int = CONFUSION_VEIN_IDX,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.weight = float(weight)
+        self.artery_idx = int(artery_idx)
+        self.vein_idx = int(vein_idx)
+        self.eps = float(eps)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        if self.weight <= 0.0:
+            return torch.zeros((), device=logits.device, dtype=logits.dtype)
+
+        probs = torch.softmax(logits, dim=1)                    # (B,C,H,W)
+        y_art = (targets == self.artery_idx).to(probs.dtype)    # (B,H,W)
+        y_vein = (targets == self.vein_idx).to(probs.dtype)     # (B,H,W)
+
+        n_art = y_art.sum().clamp(min=self.eps)
+        n_vein = y_vein.sum().clamp(min=self.eps)
+
+        # масса вероятности "чужого" класса на пикселях истинных сосудов
+        art_to_vein = (probs[:, self.vein_idx] * y_art).sum() / n_art
+        vein_to_art = (probs[:, self.artery_idx] * y_vein).sum() / n_vein
+
+        return self.weight * 0.5 * (art_to_vein + vein_to_art)
+
+
 class TopoAwareCriterion(nn.Module):
     """
-    L = L_Dice+wCE  +  w_topo(epoch) * L_SoftEuler
+    L = L_Dice+wCE  +  L_confusion(artery<->vein)  +  w_topo(epoch) * L_SoftEuler
     forward() -> (loss, info_dict)
     """
 
@@ -123,11 +195,13 @@ class TopoAwareCriterion(nn.Module):
         reduction: str = TOPO_REDUCTION,
         rel_clamp: float = TOPO_REL_CLAMP,
         tv_weight: float = TOPO_TV_WEIGHT,
+        confusion_weight: float = CONFUSION_WEIGHT,
     ):
         super().__init__()
         self.seg = WeightedCEDiceLoss(
             class_weights=class_weights, ce_coef=ce_coef, dice_coef=dice_coef
         )
+        self.confusion = ArteryVeinConfusionLoss(weight=confusion_weight)
         self.topo = SoftEulerCharacteristicLoss(
             num_classes=NUM_CLASSES,
             class_weights=class_weights,
@@ -153,12 +227,16 @@ class TopoAwareCriterion(nn.Module):
 
     def forward(self, logits, targets, epoch: Optional[int] = None):
         seg_loss = self.seg(logits, targets)
+        conf_loss = self.confusion(logits, targets)
         topo_loss, topo_info = self.topo(logits, targets, return_info=True)
+
         w = self.topo.weight if epoch is None else self.weight_at_epoch(epoch)
-        total = seg_loss + w * topo_loss
+        total = seg_loss + conf_loss + w * topo_loss
+
         info = {
             "loss_total": float(total.detach()),
             "loss_seg": float(seg_loss.detach()),
+            "loss_confusion": float(conf_loss.detach()),
             "loss_topo_raw": float(topo_loss.detach()),
             "topo_weight": float(w),
         }
@@ -219,26 +297,20 @@ class ImprovedUNetPlusPlus(BaseModel):
     # ------------------------------------------------------------------
     def _build_class_weights(self) -> torch.Tensor:
         """
-        v4: ИСПРАВЛЕНО — эффективные веса классов.
+        v5: tempered inverse-frequency веса.
 
-        ПРЕДЫДУЩАЯ ПРОБЛЕМА:
-            beta=0.9999 → при class_counts > 10000 все effective_num ≈ 1
-            → все веса = 1.0 → балансировка НЕ работает.
+        Формула:
+            freq_c  = count_c / total_pixels
+            w_c     = clip( (1 / freq_c) ** CLASS_WEIGHT_POWER,
+                            CLASS_WEIGHT_MIN, CLASS_WEIGHT_MAX )
+            w_c    /= mean(w)
 
-        НОВОЕ РЕШЕНИЕ:
-            Обратная частота с температурой (sqrt).
-            freq_c = count_c / total_pixels
-            weight_c = sqrt(1 / freq_c), нормировка к среднему = 1.
-
-            Это даёт:
-              - фон (~85% пикселей):     вес ≈ 0.35
-              - артерии (~4%):           вес ≈ 1.6
-              - вены (~5%):              вес ≈ 1.4
-              - crossings (~1%):         вес ≈ 3.2
-              - капилляры (~5%):         вес ≈ 1.4
-
-            Справедливо: редкие классы получают больший вес,
-            но без экстремальных значений (в отличие от 1/freq без корня).
+        ИСТОРИЯ ВОПРОСА:
+          * до v4 (beta=0.9999) все веса схлопывались в 1.0 — балансировки не было;
+          * в v4 (степень 0.5) фон получил 0.08 -> утечка сосудов и падение
+            precision артерий/вен на 4-5 п.п.;
+          * степень 0.15 + кламп — баланс: фон 0.53 (надзор за утечками),
+            приоритетные артерии/вены ~0.8, редкие классы усилены умеренно.
         """
         print(f'Building class weights')
         mask_paths = sorted(settings.TRAIN_MASK_DIR.glob("*.png"))
@@ -253,18 +325,19 @@ class ImprovedUNetPlusPlus(BaseModel):
             bincount = np.bincount(mask_labels.reshape(-1), minlength=NUM_CLASSES)
             class_counts += bincount
 
-        # --- v4: обратная частота с температурой ---
-        total_pixels = class_counts.sum()
-        freq = class_counts / max(total_pixels, 1.0)
-        freq = np.maximum(freq, 1e-8)  # защита от деления на 0
+        # --- v5: tempered inverse frequency ---
+        total_pixels = max(class_counts.sum(), 1.0)
+        freq = class_counts / total_pixels
+        freq = np.maximum(freq, 1e-6)
 
-        # Температура 0.5 (корень) — умеренное усиление редких классов
-        weights = np.sqrt(1.0 / freq)
+        weights = np.power(1.0 / freq, CLASS_WEIGHT_POWER)
+        weights = np.clip(weights, CLASS_WEIGHT_MIN, CLASS_WEIGHT_MAX)
         weights = weights / weights.mean()
 
         print(f'Class frequencies: '
               f'{ {settings.CLASS_NAMES[i]: round(float(freq[i]), 4) for i in range(NUM_CLASSES)} }')
-        print(f'Class weights (inverse-freq, sqrt): '
+        print(f'Class weights (inv-freq^{CLASS_WEIGHT_POWER}, '
+              f'clamp [{CLASS_WEIGHT_MIN}, {CLASS_WEIGHT_MAX}]): '
               f'{ {settings.CLASS_NAMES[i]: round(float(weights[i]), 4) for i in range(NUM_CLASSES)} }')
 
         return torch.tensor(weights, dtype=torch.float32)
@@ -341,11 +414,12 @@ class ImprovedUNetPlusPlus(BaseModel):
             save_best: bool = True, patience=None, **kwargs):
 
         print(f'Start fitting')
-        print(f'[topo v4] value_mode={TOPO_VALUE_MODE}, gradient_mode={TOPO_GRADIENT_MODE}, '
-              f'weight={TOPO_WEIGHT}, warmup={TOPO_WARMUP_EPOCHS}, ramp={TOPO_RAMP_EPOCHS}, '
-              f'temperature={TOPO_TEMPERATURE}, exclude_background=True')
-        print(f'[topo v4] Откат к v2: TV=0, Boundary=0, Connectivity=0')
-        print(f'[topo v4] EPOCHS_COUNT={EPOCHS_COUNT}')
+        print(f'[v5] class weights: power={CLASS_WEIGHT_POWER}, '
+              f'clamp=[{CLASS_WEIGHT_MIN}, {CLASS_WEIGHT_MAX}]')
+        print(f'[v5] confusion loss: weight={CONFUSION_WEIGHT} '
+              f'(artery idx={CONFUSION_ARTERY_IDX}, vein idx={CONFUSION_VEIN_IDX})')
+        print(f'[v5] topo без изменений: weight={TOPO_WEIGHT}, '
+              f'warmup={TOPO_WARMUP_EPOCHS}, ramp={TOPO_RAMP_EPOCHS}')
 
         self._ensure_scheduler(len(train_loader))
         self.history = []
@@ -363,7 +437,7 @@ class ImprovedUNetPlusPlus(BaseModel):
         for epoch in range(EPOCHS_COUNT):
             self.model.train()
             train_loss = 0.0
-            ep_seg, ep_topo, ep_w = 0.0, 0.0, 0.0
+            ep_seg, ep_conf, ep_topo, ep_w = 0.0, 0.0, 0.0, 0.0
             n_steps = 0
 
             for images, masks in train_loader:
@@ -380,6 +454,7 @@ class ImprovedUNetPlusPlus(BaseModel):
 
                 train_loss += float(info["loss_total"])
                 ep_seg += float(info["loss_seg"])
+                ep_conf += float(info["loss_confusion"])
                 ep_topo += float(info["loss_topo_raw"])
                 ep_w = float(info["topo_weight"])
                 n_steps += 1
@@ -387,6 +462,7 @@ class ImprovedUNetPlusPlus(BaseModel):
             n_steps = max(n_steps, 1)
             train_loss /= n_steps
             ep_seg /= n_steps
+            ep_conf /= n_steps
             ep_topo /= n_steps
 
             current_lr = self.optimizer.param_groups[0]["lr"]
@@ -398,6 +474,7 @@ class ImprovedUNetPlusPlus(BaseModel):
                 "lr": current_lr,
                 "train_loss": train_loss,
                 "train_seg_loss": ep_seg,
+                "train_confusion_loss": ep_conf,
                 "train_topo_loss_raw": ep_topo,
                 "topo_weight": ep_w,
             }
@@ -412,7 +489,7 @@ class ImprovedUNetPlusPlus(BaseModel):
 
                 if epoch == TOPO_WARMUP_EPOCHS - 1:
                     pre_topo_dice = v_dice
-                    print(f"[topo v4] Запомнил Dice перед topo: {pre_topo_dice:.4f}")
+                    print(f"[topo] Запомнил Dice перед topo: {pre_topo_dice:.4f}")
 
                 if (ADAPTIVE_TOPO_WEIGHT and not adaptive_applied
                     and epoch == ADAPTIVE_CHECK_EPOCH - 1 and pre_topo_dice is not None):
@@ -420,9 +497,9 @@ class ImprovedUNetPlusPlus(BaseModel):
                     if dice_drop > DICE_DROP_THRESHOLD:
                         old_weight = self.criterion.topo.weight
                         self.criterion.topo.weight *= 0.5
-                        print(f"[topo v4] ⚠️ Dice упал на {dice_drop:.3f} "
+                        print(f"[topo] Dice упал на {dice_drop:.3f} "
                               f"(с {pre_topo_dice:.4f} до {v_dice:.4f}). "
-                              f"Уменьшаю topo_weight: {old_weight:.3f} → {self.criterion.topo.weight:.3f}")
+                              f"Уменьшаю topo_weight: {old_weight:.3f} -> {self.criterion.topo.weight:.3f}")
                         adaptive_applied = True
 
                 if SELECT_BEST_CHECKPOINT:
@@ -445,7 +522,7 @@ class ImprovedUNetPlusPlus(BaseModel):
             self.history.append(record)
             print(f"Epoch {epoch+1}/{EPOCHS_COUNT} | "
                   f"Train Loss: {train_loss:.4f} (seg {ep_seg:.4f} + "
-                  f"{ep_w:.2f}·topo {ep_topo:.4f})"
+                  f"conf {ep_conf:.4f} + {ep_w:.2f}·topo {ep_topo:.4f})"
                   f"{topo_str} | Left approx {time_left_str}")
 
         # ---------------- финальный выбор весов ----------------
@@ -502,7 +579,9 @@ class ImprovedUNetPlusPlus(BaseModel):
                 "union_weight": TOPO_UNION_WEIGHT,
                 "reduction": TOPO_REDUCTION,
                 "exclude_background": True,
-                "version": "v4",
+                "confusion_weight": CONFUSION_WEIGHT,
+                "class_weight_power": CLASS_WEIGHT_POWER,
+                "version": "v5",
             },
         }, path)
 
@@ -536,7 +615,7 @@ class ImprovedUNetPlusPlus(BaseModel):
 
     @staticmethod
     def get_model_name():
-        return 'UNET-WCD-TOPO-v4'
+        return 'UNET-WCD-TOPO-v5'
 
     @staticmethod
     def get_val_viz_path() -> pathlib.Path:
