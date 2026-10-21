@@ -130,11 +130,28 @@ def _validate_settings_for_cv(source_keys: List[str]) -> None:
 # ===========================================================================
 # Лоадеры
 # ===========================================================================
+# ---------------------------------------------------------------------------
+# v5: дополнительные аугментации обучения.
+# Только цветовые трансформации (применяются ТОЛЬКО к изображению, маски
+# не трогают): повышают робастность различения артерий/вен к балансу белого
+# и экспозиции снимка. Для чистого A/B лосса поставьте False.
+# ---------------------------------------------------------------------------
+USE_EXTRA_AUG = True
+
+
 def _make_train_loader(img_paths, mask_paths, bs, nw, extra):
     transforms: List[A.BasicTransform] = [
         A.RandomRotate90(p=0.5),
         A.HorizontalFlip(p=0.5),
     ]
+    if USE_EXTRA_AUG:
+        transforms += [
+            # яркость/контраст: разные камеры и экспозиция глазного дна
+            A.RandomBrightnessContrast(brightness_limit=0.15, contrast_limit=0.15, p=0.4),
+            # ЛЁГКИЙ сдвиг оттенка/насыщенности (не ломаем цветовой признак
+            # артерия/вена: пределы малы)
+            A.HueSaturationValue(hue_shift_limit=3, sat_shift_limit=10, val_shift_limit=10, p=0.3),
+        ]
     if extra:
         transforms.extend(extra)
     transforms.append(ToTensorV2())
