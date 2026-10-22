@@ -4,6 +4,7 @@ import gc
 from importlib import metadata
 from pathlib import Path
 import platform
+import zipfile
 
 import pandas as pd
 import torch
@@ -36,12 +37,45 @@ def versions():
     return result
 
 
+def archive_csv_metrics_and_logs():
+    """Copy all run CSVs to an additional ZIP; keep original outputs untouched.
+
+    Rebuild after each CSV save, including each training epoch. Both evaluation
+    variants are included if present. Checkpoints, images and other non-CSV
+    files are deliberately excluded. Replace the previous ZIP only on success.
+    """
+    output = Path(settings.OUTPUT_DIR).resolve()
+    csv_paths = sorted(path for path in output.rglob("*.csv") if path.is_file())
+    if not csv_paths:
+        return None
+
+    model_dir = Path(__file__).resolve().parent / "UNETPP_WCD"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = model_dir / f"{output.name}_metrics_logs.zip"
+    temporary = archive_path.with_name(archive_path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(
+            temporary, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6,
+        ) as archive:
+            for csv_path in csv_paths:
+                # Preserve paths so evaluation and evaluation_tta cannot collide.
+                member = (Path(output.name) / csv_path.relative_to(output)).as_posix()
+                archive.write(csv_path, arcname=member)
+        temporary.replace(archive_path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return archive_path
+
+
 def save_csv(frame, path, index=False):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     frame.to_csv(temporary, index=index)
     temporary.replace(path)
+    # Also captures fold_*_history.csv written by the epoch-end callback.
+    archive_csv_metrics_and_logs()
 
 
 def main(argv=None):
@@ -169,6 +203,9 @@ def main(argv=None):
     print("\nFold summary (pixel-pooled within each fold):")
     print(summary)
     print(f"Results saved in: {eval_dir}")
+    archive_path = archive_csv_metrics_and_logs()
+    if archive_path is not None:
+        print(f"Additional CSV metrics/history archive saved in: {archive_path}")
     print("Bootstrap intervals describe mean per-image OOF metrics conditional on these models.")
 
 
