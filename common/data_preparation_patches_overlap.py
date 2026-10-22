@@ -1,5 +1,7 @@
 # common/data_preparation_patches.py
 import re
+import copy
+import random
 import typing as tp
 from collections import defaultdict
 from pathlib import Path
@@ -13,6 +15,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from common import settings_patches_overlap as settings
+from common.experiment_utils_overlap import strict_rgb_to_labels
 
 
 # ===========================================================================
@@ -38,7 +41,7 @@ class SegmentationDataset(Dataset):
         self.image_paths = list(image_paths)
         self.mask_paths = list(mask_paths)
         self.transform = transform
-        self._checked_once = False
+
 
     def __len__(self) -> int:
         return len(self.image_paths)
@@ -49,52 +52,45 @@ class SegmentationDataset(Dataset):
         RGB-маска (H, W, 3) -> индексы классов (H, W) uint8.
         settings.COLOR_MAP: {class_idx: (R, G, B)}.
         """
-        assert mask_rgb.ndim == 3 and mask_rgb.shape[2] == 3, \
-            f"Ожидали RGB-маску (H,W,3), получили {mask_rgb.shape}"
-        h, w, _ = mask_rgb.shape
-        mask_labels = np.zeros((h, w), dtype=np.uint8)
-        for class_idx, color in settings.COLOR_MAP.items():
-            color_arr = np.array(color, dtype=mask_rgb.dtype)
-            color_mask = np.all(mask_rgb == color_arr, axis=-1)
-            mask_labels[color_mask] = class_idx
-        return mask_labels
+        return strict_rgb_to_labels(mask_rgb, settings.COLOR_MAP)
 
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
         msk_path = self.mask_paths[idx]
 
         try:
-            image = np.array(Image.open(img_path).convert("RGB"))
+            with Image.open(img_path) as opened:
+                image = np.array(opened.convert("RGB"))
         except Exception as e:
             raise RuntimeError(f"Не удалось прочитать изображение {img_path}: {e}")
 
         try:
-            mask_rgb = np.array(Image.open(msk_path).convert("RGB"))
+            with Image.open(msk_path) as opened:
+                mask_rgb = np.array(opened.convert("RGB"))
         except Exception as e:
             raise RuntimeError(f"Не удалось прочитать маску {msk_path}: {e}")
 
-        mask = self.rgb_to_labels(mask_rgb)
-
-        # Разовая проверка: нет ли в маске классов, которых нет в COLOR_MAP
-        if not self._checked_once:
-            uniq = set(np.unique(mask).tolist())
-            known = set(settings.COLOR_MAP.keys())
-            unknown = uniq - known
-            assert not unknown, (
-                f"В маске {msk_path} найдены классы {unknown}, "
-                f"которых нет в COLOR_MAP {sorted(known)}"
-            )
-            self._checked_once = True
+        if image.shape[:2] != mask_rgb.shape[:2]:
+            raise ValueError(f"Image/mask size mismatch: {img_path}, {msk_path}")
+        if image.shape[:2] != (settings.PATCH_SIZE, settings.PATCH_SIZE):
+            raise ValueError(f"Expected {settings.PATCH_SIZE}px patch: {img_path}")
+        try:
+            mask = self.rgb_to_labels(mask_rgb)
+        except ValueError as exc:
+            raise ValueError(f"{msk_path}: {exc}") from exc
 
         if self.transform:
             augmented = self.transform(image=image, mask=mask)
             image = augmented["image"]
             mask = augmented["mask"]
 
+        if isinstance(image, np.ndarray):
+            image = torch.from_numpy(
+                np.ascontiguousarray(image.transpose(2, 0, 1))
+            ).float() / 255.0
         if isinstance(mask, np.ndarray):
-            mask = torch.from_numpy(mask)
-        mask = mask.long()
-        return image, mask
+            mask = torch.from_numpy(np.ascontiguousarray(mask))
+        return image.float(), mask.long()
 
 
 # ===========================================================================
@@ -106,9 +102,12 @@ _PATCH_SUFFIX_RE = re.compile(r"_y\d+_x\d+$")
 def _source_key(path: Path) -> str:
     """
     '003_N_y0_x256.png' -> '003_N'
-    Если суффикса нет — возвращает stem как есть.
+    Некорректный суффикс — ошибка, а не отдельный источник.
     """
-    return _PATCH_SUFFIX_RE.sub("", path.stem)
+    match = _PATCH_SUFFIX_RE.search(path.stem)
+    if match is None or match.start() == 0:
+        raise ValueError(f"Expected '<source>_y<Y>_x<X>.png': {path.name}")
+    return path.stem[:match.start()]
 
 
 def _group_patches_by_source(
@@ -164,7 +163,8 @@ def _validate_dataset() -> tp.Tuple[List[Path], List[Path]]:
         f"len(images)={len(img_paths)} != len(masks)={len(msk_paths)}"
     )
 
-    return img_paths, msk_paths
+    mask_by_stem = {p.stem: p for p in msk_paths}
+    return img_paths, [mask_by_stem[p.stem] for p in img_paths]
 
 
 def _validate_settings_for_cv(source_keys: List[str]) -> None:
@@ -190,12 +190,35 @@ def _validate_settings_for_cv(source_keys: List[str]) -> None:
 # ===========================================================================
 # Лоадеры
 # ===========================================================================
+def seed_worker(worker_id):
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed)
+    np.random.seed(seed)
+    info = torch.utils.data.get_worker_info()
+    transform = getattr(info.dataset, "transform", None)
+    if hasattr(transform, "set_random_seed"):
+        transform.set_random_seed(seed)
+
+
+def _compose(transforms, seed):
+    transform = A.Compose(copy.deepcopy(transforms))
+    if hasattr(transform, "set_random_seed"):
+        transform.set_random_seed(seed)
+    return transform
+
+
+def _generator(seed):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
+
 def _make_train_loader(
     img_paths: List[Path],
     mask_paths: List[Path],
     bs: int,
     nw: int,
     extra_transforms: Optional[List[A.BasicTransform]] = None,
+    seed: int = settings.SEED,
 ) -> DataLoader:
     transforms: List[A.BasicTransform] = [
         A.RandomRotate90(p=0.5),
@@ -205,16 +228,13 @@ def _make_train_loader(
     if extra_transforms:
         transforms.extend(extra_transforms)
     transforms.append(ToTensorV2())
-    transform = A.Compose(transforms)
+    transform = _compose(transforms, seed)
 
     dataset = SegmentationDataset(img_paths, mask_paths, transform=transform)
     return DataLoader(
-        dataset,
-        batch_size=bs,
-        shuffle=True,
-        num_workers=nw,
-        pin_memory=True,
-        drop_last=False,
+        dataset, batch_size=bs, shuffle=True, num_workers=nw,
+        pin_memory=torch.cuda.is_available(), drop_last=False,
+        generator=_generator(seed), worker_init_fn=seed_worker,
     )
 
 
@@ -229,16 +249,13 @@ def _make_val_loader(
     if extra_transforms:
         transforms.extend(extra_transforms)
     transforms.append(ToTensorV2())
-    transform = A.Compose(transforms)
+    transform = _compose(transforms, settings.SEED)
 
     dataset = SegmentationDataset(img_paths, mask_paths, transform=transform)
     return DataLoader(
-        dataset,
-        batch_size=bs,
-        shuffle=False,
-        num_workers=nw,
-        pin_memory=True,
-        drop_last=False,
+        dataset, batch_size=bs, shuffle=False, num_workers=nw,
+        pin_memory=torch.cuda.is_available(), drop_last=False,
+        generator=_generator(settings.SEED), worker_init_fn=seed_worker,
     )
 
 
@@ -259,6 +276,7 @@ def create_cross_val_loaders(
 
     settings.TEST_SIZE — число ИСХОДНЫХ изображений в val-фолде.
     """
+    settings.validate_settings()
     img_paths, msk_paths = _validate_dataset()
 
     groups = _group_patches_by_source(img_paths, msk_paths)
@@ -274,8 +292,10 @@ def create_cross_val_loaders(
     num_folds = settings.FOLDS_NUM
     test_size = settings.TEST_SIZE
 
-    bs = batch_size or settings.BATCH_SIZE
-    nw = num_workers or settings.NUM_WORKERS
+    bs = settings.BATCH_SIZE if batch_size is None else batch_size
+    nw = settings.NUM_WORKERS if num_workers is None else num_workers
+    if bs < 1 or nw < 0:
+        raise ValueError("Invalid batch size or worker count.")
 
     if verbose:
         print(f"[CV] источников={total_sources}, патчей={len(img_paths)}, "
@@ -300,14 +320,14 @@ def create_cross_val_loaders(
 
         train_imgs: List[Path] = []
         train_masks: List[Path] = []
-        for k in train_keys:
+        for k in sorted(train_keys):
             i_list, m_list = groups[k]
             train_imgs.extend(i_list)
             train_masks.extend(m_list)
 
         val_imgs: List[Path] = []
         val_masks: List[Path] = []
-        for k in val_keys:
+        for k in sorted(val_keys):
             i_list, m_list = groups[k]
             val_imgs.extend(i_list)
             val_masks.extend(m_list)
@@ -320,7 +340,8 @@ def create_cross_val_loaders(
         assert len(val_imgs) > 0, f"fold {fold}: пустой val_imgs"
 
         train_loader = _make_train_loader(
-            train_imgs, train_masks, bs, nw, train_extra_transforms
+            train_imgs, train_masks, bs, nw, train_extra_transforms,
+            seed=settings.SEED + fold + 1,
         )
         val_loader = _make_val_loader(
             val_imgs, val_masks, bs, nw, val_extra_transforms

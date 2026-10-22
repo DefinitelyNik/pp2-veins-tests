@@ -1,234 +1,170 @@
-# UNETPP_WCD/model_patches_overlap.py
-import copy
-import time
+"""UNet++: train-only CE weights, foreground/union Dice and soft clDice.
+
+Place in UNETPP_WCD/model_patches_overlap.py. No dependency on the unprovided
+BaseModel implementation. Public fit/predict/save/load/path methods are retained.
+Checkpoints are inference checkpoints; exact training resume is NOT supported.
+"""
 import pathlib
-from typing import Dict, List, Optional
+import time
+import warnings
 
 import albumentations as A
 import numpy as np
-from PIL import Image
 import segmentation_models_pytorch as smp
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from common import settings_patches_overlap as settings
-from common.base_model import BaseModel
-from common import utils
-from common.topology_loss import SoftEulerCharacteristicLoss
-from common.topology_metrics import TopologyErrorAccumulator
+from common.experiment_utils_overlap import read_rgb, strict_rgb_to_labels
 
 NUM_CLASSES = settings.NUM_CLASSES
+EPOCHS_COUNT = settings.EPOCHS_COUNT
+LEARNING_RATE = settings.LEARNING_RATE
+WEIGHT_DECAY = settings.WEIGHT_DECAY
+ENCODER_NAME = settings.ENCODER_NAME
+ENCODER_WEIGHTS = settings.ENCODER_WEIGHTS
+MEAN, STD = settings.MEAN, settings.STD
 
-# ---------------------------------------------------------------------------
-# Бюджет обучения — БЕЗ ИЗМЕНЕНИЙ (см. обоснование в model_patches.py)
-# ---------------------------------------------------------------------------
-EPOCHS_COUNT = 50
-LEARNING_RATE = 3e-4
-WEIGHT_DECAY = 1e-4
-
-ENCODER_NAME = "efficientnet-b0"
-ENCODER_WEIGHTS = "imagenet"
-
-MEAN = (0.485, 0.456, 0.406)
-STD = (0.229, 0.224, 0.225)
-
-# ---------------------------------------------------------------------------
-# Гиперпараметры топологического лосса (Soft Euler Characteristic)
-# ---------------------------------------------------------------------------
-TOPO_WEIGHT = 0.5
-TOPO_WARMUP_EPOCHS = 10
-TOPO_RAMP_EPOCHS = 5
-TOPO_VALUE_MODE = "hard"
-TOPO_GRADIENT_MODE = "soft"
-TOPO_TEMPERATURE = 1.0
-TOPO_WEIGHT_TEMPERATURE = 0.5
-TOPO_ABSENT_CLASS_SCALE = 0.5
-TOPO_UNION_WEIGHT = 1.0
-TOPO_REDUCTION = "smooth_l1"
-TOPO_REL_CLAMP = 5.0
-TOPO_TV_WEIGHT = 0.0
-
-# ---------------------------------------------------------------------------
-# Валидация и отбор чекпоинта
-# ---------------------------------------------------------------------------
-SELECT_BEST_CHECKPOINT = True
-TOPO_AWARE_SELECTION = True
-SELECTION_DICE_TOL = 0.01
-VAL_EVERY_EPOCHS = 1
-TOPO_METRICS_IN_VAL = True
+train_extra_transforms = []
+if settings.USE_PHOTOMETRIC_AUG:
+    train_extra_transforms.extend([
+        A.RandomBrightnessContrast(
+            brightness_limit=0.10, contrast_limit=0.10, p=0.30
+        ),
+        A.HueSaturationValue(
+            hue_shift_limit=0, sat_shift_limit=5, val_shift_limit=5, p=0.20
+        ),
+    ])
+train_extra_transforms.append(A.Normalize(mean=MEAN, std=STD))
+val_extra_transforms = [A.Normalize(mean=MEAN, std=STD)]
 
 
-train_extra_transforms = [
-    A.Normalize(mean=MEAN, std=STD),
-]
-
-val_extra_transforms = [
-    A.Normalize(mean=MEAN, std=STD),
-]
+def soft_erode(x):
+    vertical = -F.max_pool2d(-x, (3, 1), stride=1, padding=(1, 0))
+    horizontal = -F.max_pool2d(-x, (1, 3), stride=1, padding=(0, 1))
+    return torch.minimum(vertical, horizontal)
 
 
-# ===========================================================================
-# Losses
-# ===========================================================================
-class WeightedCEDiceLoss(nn.Module):
-    """
-    Weighted CrossEntropy + DiceLoss для multiclass segmentation.
-    CE помогает пиксельной классификации, Dice помогает при сильном дисбалансе классов.
-    """
-    def __init__(self, class_weights=None, ce_coef=1.0, dice_coef=1.0):
+def soft_open(x):
+    return F.max_pool2d(soft_erode(x), 3, stride=1, padding=1)
+
+
+def soft_skeletonize(x, iterations):
+    skeleton = F.relu(x - soft_open(x))
+    for _ in range(iterations):
+        x = soft_erode(x)
+        delta = F.relu(x - soft_open(x))
+        skeleton = skeleton + F.relu(delta - skeleton * delta)
+    return skeleton
+
+
+def soft_cldice_loss(prob, target, iterations=10, eps=1e-6):
+    pred_skeleton = soft_skeletonize(prob, iterations)
+    with torch.no_grad():
+        target_skeleton = soft_skeletonize(target, iterations)
+    dims = (1, 2, 3)
+    precision = ((pred_skeleton * target).sum(dims) + eps) / (
+        pred_skeleton.sum(dims) + eps
+    )
+    recall = ((target_skeleton * prob).sum(dims) + eps) / (
+        target_skeleton.sum(dims) + eps
+    )
+    score = 2 * precision * recall / (precision + recall + eps)
+    present = target.sum(dims) > 0
+    return 1 - score[present].mean() if present.any() else prob.sum() * 0
+
+
+class VesselAwareLoss(nn.Module):
+    def __init__(self, class_weights, union_coef=0.25, topology_coef=0.10,
+                 skeleton_iterations=10):
         super().__init__()
-        self.ce = nn.CrossEntropyLoss(weight=class_weights)
-        self.dice = smp.losses.DiceLoss(mode="multiclass", from_logits=True)
-        self.ce_coef = ce_coef
-        self.dice_coef = dice_coef
+        self.register_buffer("class_weights", class_weights.clone().float())
+        self.union_coef = float(union_coef)
+        self.topology_coef = float(topology_coef)
+        self.skeleton_iterations = int(skeleton_iterations)
+        self.topology_scale = 0.0
 
     def forward(self, logits, targets):
-        return self.ce_coef * self.ce(logits, targets) + self.dice_coef * self.dice(logits, targets)
-
-
-class TopoAwareCriterion(nn.Module):
-    """
-    L = L_Dice+wCE  +  w_topo(epoch) * L_SoftEuler
-    forward() -> (loss, info_dict)
-    """
-
-    def __init__(
-        self,
-        class_weights: torch.Tensor,
-        ce_coef: float = 1.0,
-        dice_coef: float = 1.0,
-        topo_weight: float = TOPO_WEIGHT,
-        warmup_epochs: int = TOPO_WARMUP_EPOCHS,
-        ramp_epochs: int = TOPO_RAMP_EPOCHS,
-        value_mode: str = TOPO_VALUE_MODE,
-        gradient_mode: str = TOPO_GRADIENT_MODE,
-        temperature: float = TOPO_TEMPERATURE,
-        weight_temperature: float = TOPO_WEIGHT_TEMPERATURE,
-        absent_class_scale: float = TOPO_ABSENT_CLASS_SCALE,
-        union_weight: float = TOPO_UNION_WEIGHT,
-        reduction: str = TOPO_REDUCTION,
-        rel_clamp: float = TOPO_REL_CLAMP,
-        tv_weight: float = TOPO_TV_WEIGHT,
-    ):
-        super().__init__()
-        self.seg = WeightedCEDiceLoss(
-            class_weights=class_weights, ce_coef=ce_coef, dice_coef=dice_coef
+        logits, targets = logits.float(), targets.long()
+        ce = F.cross_entropy(logits, targets, weight=self.class_weights)
+        probs = logits.softmax(1)
+        target_one_hot = F.one_hot(
+            targets, num_classes=logits.shape[1]
+        ).permute(0, 3, 1, 2).float()
+        dims = (0, 2, 3)
+        pred_fg, target_fg = probs[:, 1:], target_one_hot[:, 1:]
+        target_sum = target_fg.sum(dims)
+        intersection = (pred_fg * target_fg).sum(dims)
+        dice = (2 * intersection + 1e-6) / (
+            pred_fg.sum(dims) + target_sum + 1e-6
         )
-        self.topo = SoftEulerCharacteristicLoss(
-            num_classes=NUM_CLASSES,
-            class_weights=class_weights,
-            weight=topo_weight,
-            warmup_epochs=warmup_epochs,
-            ramp_epochs=ramp_epochs,
-            value_mode=value_mode,
-            gradient_mode=gradient_mode,
-            temperature=temperature,
-            weight_temperature=weight_temperature,
-            absent_class_scale=absent_class_scale,
-            rel_clamp=rel_clamp,
-            reduction=reduction,
-            include_union=True,
-            union_weight=union_weight,
-            tv_weight=tv_weight,
-            background_index=0,
-        )
+        present = target_sum > 0
+        fg_loss = 1 - dice[present].mean() if present.any() else probs.sum() * 0
+        loss = ce + fg_loss
+        vessel_prob = probs[:, 1:].sum(1, keepdim=True)
+        vessel_target = (targets > 0).unsqueeze(1).float()
+        if self.union_coef:
+            intersection = (vessel_prob * vessel_target).sum()
+            union_dice = (2 * intersection + 1e-6) / (
+                vessel_prob.sum() + vessel_target.sum() + 1e-6
+            )
+            loss = loss + self.union_coef * (1 - union_dice)
+        if self.topology_coef and self.topology_scale:
+            loss = loss + self.topology_coef * self.topology_scale * soft_cldice_loss(
+                vessel_prob, vessel_target, self.skeleton_iterations
+            )
+        return loss
 
-    def weight_at_epoch(self, epoch: int) -> float:
-        return self.topo.weight_at_epoch(epoch)
-
-    def forward(self, logits, targets, epoch: Optional[int] = None):
-        seg_loss = self.seg(logits, targets)
-        topo_loss, topo_info = self.topo(logits, targets, return_info=True)
-        w = self.topo.weight if epoch is None else self.weight_at_epoch(epoch)
-        total = seg_loss + w * topo_loss
-        info = {
-            "loss_total": float(total.detach()),
-            "loss_seg": float(seg_loss.detach()),
-            "loss_topo_raw": float(topo_loss.detach()),
-            "topo_weight": float(w),
-        }
-        info.update(topo_info)
-        return total, info
-
-
-# ===========================================================================
-# Вспомогательные функции валидации
-# ===========================================================================
-def _class_stats_update(preds: np.ndarray, targets: np.ndarray,
-                        num_classes: int, stats: np.ndarray) -> None:
-    for c in range(num_classes):
-        p = (preds == c)
-        t = (targets == c)
-        stats[c, 0] += np.logical_and(p, t).sum()
-        stats[c, 1] += np.logical_and(p, ~t).sum()
-        stats[c, 2] += np.logical_and(~p, t).sum()
-
-
-def _macro_dice_iou(stats: np.ndarray):
-    tp, fp, fn = stats[:, 0], stats[:, 1], stats[:, 2]
-    dice = 2 * tp / (2 * tp + fp + fn + 1e-8)
-    iou = tp / (tp + fp + fn + 1e-8)
-    per_class = {c: (float(dice[c]), float(iou[c])) for c in range(stats.shape[0])}
-    return float(np.mean(dice)), float(np.mean(iou)), per_class
-
-
-# ===========================================================================
-# Model
-# ===========================================================================
-class ImprovedUNetPlusPlus(BaseModel):
-    def __init__(self):
-        super().__init__()
+class ImprovedUNetPlusPlus:
+    def __init__(self, union_coef=None, topology_coef=None,
+                 encoder_weights=ENCODER_WEIGHTS, device=None):
+        settings.validate_settings()
+        self.device = torch.device(settings.DEVICE if device is None else device)
+        self.union_coef = settings.UNION_COEF if union_coef is None else union_coef
+        self.topology_coef = settings.TOPOLOGY_COEF if topology_coef is None else topology_coef
+        if self.union_coef < 0 or self.topology_coef < 0:
+            raise ValueError("Loss coefficients must be nonnegative.")
+        self.encoder_weights = encoder_weights
         self.model = smp.UnetPlusPlus(
-            encoder_name=ENCODER_NAME,
-            encoder_weights=ENCODER_WEIGHTS,
-            in_channels=3,
-            classes=NUM_CLASSES,
-        ).to(settings.DEVICE)
-
-        class_weights = self._build_class_weights().to(settings.DEVICE)
-        self.class_weights = class_weights
-
-        self.criterion = TopoAwareCriterion(class_weights=class_weights)
-        print(f"[topo] {self.criterion.topo}")
-
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=LEARNING_RATE,
-            weight_decay=WEIGHT_DECAY,
-        )
+            encoder_name=ENCODER_NAME, encoder_weights=encoder_weights,
+            in_channels=3, classes=NUM_CLASSES,
+        ).to(self.device)
+        self.optimizer = None
         self.scheduler = None
+        self.criterion = None
+        self.class_weights = None
+        self.class_counts = None
         self.LEARNING_RATE = LEARNING_RATE
         self.is_fitted = False
-        self.history: List[Dict] = []
+        self.trained_epochs = 0
+        self.selected_epoch = None
+        self.history = []
+        self.metadata = {}
 
-    # ------------------------------------------------------------------
-    def _build_class_weights(self) -> torch.Tensor:
-        print(f'Building class weights')
-        """
-        Считаем частоты классов в train для диагностики дисбаланса.
-        Подготовку данных и pipeline не меняем.
-        """
-        mask_paths = sorted(settings.TRAIN_MASK_DIR.glob("*.png"))
-        class_counts = np.zeros(NUM_CLASSES, dtype=np.float64)
-
-        color_map = {k: np.array(v, dtype=np.uint8) for k, v in settings.COLOR_MAP.items()}
-
-        for i, mask_path in enumerate(mask_paths, start=1):
-            mask_rgb = np.array(Image.open(mask_path).convert("RGB"))
-            mask_labels = np.zeros(mask_rgb.shape[:2], dtype=np.uint8)
-            for class_idx, color in color_map.items():
-                mask_labels[np.all(mask_rgb == color, axis=-1)] = class_idx
-            bincount = np.bincount(mask_labels.reshape(-1), minlength=NUM_CLASSES)
-            class_counts += bincount
-
-        beta = 0.9999
-        effective_num = 1.0 - np.power(beta, class_counts)
-        weights = (1.0 - beta) / np.maximum(effective_num, 1e-12)
-        weights = weights / weights.mean()
-        print(f'Weights are built: '
-              f'{ {settings.CLASS_NAMES[i]: round(float(weights[i]), 4) for i in range(NUM_CLASSES)} }')
-        return torch.tensor(weights, dtype=torch.float32)
+    def _build_class_weights(self, train_loader):
+        paths = getattr(train_loader.dataset, "mask_paths", None)
+        if paths is None:
+            raise TypeError("Expected SegmentationDataset with train-only mask_paths.")
+        counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+        for path in paths:
+            labels = strict_rgb_to_labels(read_rgb(path))
+            counts += np.bincount(labels.ravel(), minlength=NUM_CLASSES)
+        if counts.sum() == 0:
+            raise ValueError("Empty training masks.")
+        present = counts > 0
+        if not present.all():
+            warnings.warn(f"Classes absent in train: {np.flatnonzero(~present).tolist()}")
+        frequencies = counts / counts.sum()
+        weights = np.ones(NUM_CLASSES, dtype=np.float64)
+        weights[present] = 1 / np.sqrt(frequencies[present])
+        weights[present] /= weights[present].mean()
+        weights = np.clip(weights, 0.25, 4.0)
+        self.class_counts = counts.tolist()
+        print("Train class pixels:", self.class_counts)
+        print("CE weights:", weights.tolist())
+        return torch.tensor(weights, dtype=torch.float32, device=self.device)
 
     def _ensure_scheduler(self, train_loader_len: int) -> None:
         if self.scheduler is None:
@@ -243,236 +179,163 @@ class ImprovedUNetPlusPlus(BaseModel):
                 final_div_factor=100.0,
             )
 
-    # ------------------------------------------------------------------
-    def _evaluate_loss(self, loader) -> float:
+    @torch.inference_mode()
+    def _validation_score(self, loader):
         self.model.eval()
-        loss_total = 0.0
-        with torch.no_grad():
-            for images, masks in loader:
-                images = images.to(settings.DEVICE, non_blocking=True)
-                masks = masks.to(settings.DEVICE, non_blocking=True)
-                logits = self.model(images)
-                loss, _ = self.criterion(logits, masks)
-                loss_total += loss.item()
-        self.model.train()
-        return loss_total / max(len(loader), 1)
+        cm = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.int64, device=self.device)
+        for images, masks in loader:
+            images = images.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True).long()
+            pred = self.model(images).argmax(1)
+            index = masks.flatten() * NUM_CLASSES + pred.flatten()
+            cm += torch.bincount(index, minlength=NUM_CLASSES ** 2).reshape(NUM_CLASSES, NUM_CLASSES)
+        denominator = cm.sum(0) + cm.sum(1)
+        dice = 2 * cm.diag().double() / denominator.clamp_min(1)
+        return dice[1:].mean().item()
 
-    def _cpu_state(self) -> Dict[str, torch.Tensor]:
-        return {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-
-    @torch.no_grad()
-    def _validate(self, val_loader) -> Dict[str, float]:
-        was_training = self.model.training
-        self.model.eval()
-
-        stats = np.zeros((NUM_CLASSES, 3), dtype=np.float64)
-        acc = TopologyErrorAccumulator(
-            NUM_CLASSES, settings.CLASS_NAMES,
-            include_background=True, include_union=True,
-        ) if TOPO_METRICS_IN_VAL else None
-
-        for images, masks in val_loader:
-            images = images.to(settings.DEVICE, non_blocking=True)
-            logits = self.model(images)
-            preds = logits.argmax(dim=1).cpu().numpy().astype(np.uint8)
-            tgts = masks.numpy().astype(np.uint8)
-
-            _class_stats_update(preds, tgts, NUM_CLASSES, stats)
-            if acc is not None:
-                acc.update(preds, tgts)
-
-        macro_dice, macro_iou, per_class = _macro_dice_iou(stats)
-        out = {"val_macro_dice": macro_dice, "val_macro_iou": macro_iou}
-        for c, (d, i) in per_class.items():
-            out[f"val_dice_{settings.CLASS_NAMES[c]}"] = d
-
-        if acc is not None:
-            out.update(acc.compute())
-            out["val_topo_error"] = acc.summary()
-        else:
-            out["val_topo_error"] = float("inf")
-
-        if was_training:
-            self.model.train()
-        return out
-
-    # ------------------------------------------------------------------
-    def fit(self, train_loader, val_loader: Optional[torch.utils.data.DataLoader] = None,
-            save_best: bool = True, patience=None, **kwargs):
-
-        print(f'Start fitting')
-        print(f'[topo] value_mode={TOPO_VALUE_MODE}, gradient_mode={TOPO_GRADIENT_MODE}, '
-              f'weight={TOPO_WEIGHT}, warmup={TOPO_WARMUP_EPOCHS}, ramp={TOPO_RAMP_EPOCHS}')
-
+    def fit(self, train_loader, val_loader=None, save_best=False, patience=None,
+            on_epoch_end=None, **kwargs):
+        if kwargs:
+            raise TypeError(f"Unsupported fit arguments: {sorted(kwargs)}")
+        if self.is_fitted or self.trained_epochs:
+            raise RuntimeError("Create a fresh model; resume is not implemented.")
+        if not len(train_loader):
+            raise ValueError("Empty train_loader.")
+        if patience is not None:
+            raise ValueError("Early stopping is disabled: exactly 50 epochs required.")
+        if save_best and val_loader is None:
+            raise ValueError("save_best requires INNER validation, never the outer test fold.")
+        self.class_weights = self._build_class_weights(train_loader)
+        self.criterion = VesselAwareLoss(
+            self.class_weights, self.union_coef, self.topology_coef,
+            settings.SKELETON_ITERATIONS,
+        ).to(self.device)
+        self.optimizer = optim.AdamW(
+            self.model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        )
         self._ensure_scheduler(len(train_loader))
-        self.history = []
-
-        best_dice = -1.0
-        best_state_dice: Optional[Dict[str, torch.Tensor]] = None
-        band_topo = float("inf")
-        band_dice = -1.0
-        band_state: Optional[Dict[str, torch.Tensor]] = None
-
         start = time.time()
+        best_score, best_state = -float("inf"), None
         for epoch in range(EPOCHS_COUNT):
             self.model.train()
-            train_loss = 0.0
-            ep_seg, ep_topo, ep_w = 0.0, 0.0, 0.0
-            n_steps = 0
-
+            self.criterion.topology_scale = min(1.0, max(0.0, (epoch - 4) / 10.0))
+            total, samples = 0.0, 0
             for images, masks in train_loader:
-                images = images.to(settings.DEVICE, non_blocking=True)
-                masks = masks.to(settings.DEVICE, non_blocking=True)
-
+                images = images.to(self.device, non_blocking=True)
+                masks = masks.to(self.device, non_blocking=True).long()
                 self.optimizer.zero_grad(set_to_none=True)
-                logits = self.model(images)
-                loss, info = self.criterion(logits, masks, epoch=epoch)
+                loss = self.criterion(self.model(images), masks)
+                if not torch.isfinite(loss):
+                    raise FloatingPointError(f"Nonfinite loss at epoch {epoch + 1}")
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                nn.utils.clip_grad_norm_(self.model.parameters(), 1.0, error_if_nonfinite=True)
                 self.optimizer.step()
                 self.scheduler.step()
-
-                train_loss += float(info["loss_total"])
-                ep_seg += float(info["loss_seg"])
-                ep_topo += float(info["loss_topo_raw"])
-                ep_w = float(info["topo_weight"])
-                n_steps += 1
-
-            n_steps = max(n_steps, 1)
-            train_loss /= n_steps
-            ep_seg /= n_steps
-            ep_topo /= n_steps
-
-            current_lr = self.optimizer.param_groups[0]["lr"]
-            approx_time_left = (time.time() - start) / (epoch + 1) * (EPOCHS_COUNT - epoch - 1)
-            time_left_str = utils.beautify_time_left(approx_time_left)
-
-            record = {
-                "epoch": epoch + 1,
-                "lr": current_lr,
-                "train_loss": train_loss,
-                "train_seg_loss": ep_seg,
-                "train_topo_loss_raw": ep_topo,
-                "topo_weight": ep_w,
+                total += loss.item() * images.shape[0]
+                samples += images.shape[0]
+            self.trained_epochs = epoch + 1
+            row = {
+                "epoch": epoch + 1, "train_loss": total / samples,
+                "lr": float(self.optimizer.param_groups[0]["lr"]),
+                "topology_scale": self.criterion.topology_scale,
             }
-
-            do_val = (val_loader is not None) and ((epoch + 1) % VAL_EVERY_EPOCHS == 0)
-            if do_val:
-                vm = self._validate(val_loader)
-                record.update(vm)
-                v_dice = vm["val_macro_dice"]
-                v_topo = vm["val_topo_error"]
-
-                if SELECT_BEST_CHECKPOINT:
-                    if v_dice > best_dice:
-                        best_dice = v_dice
-                        best_state_dice = self._cpu_state()
-
-                    if (TOPO_AWARE_SELECTION
-                            and v_dice >= best_dice - SELECTION_DICE_TOL
-                            and v_topo < band_topo):
-                        band_topo = v_topo
-                        band_dice = v_dice
-                        band_state = self._cpu_state()
-
-                topo_str = (f" | Val Dice: {v_dice:.4f} | Val TopoErr: {v_topo:.3f}"
-                            f" | bestDice: {best_dice:.4f}")
-            else:
-                topo_str = ""
-
-            self.history.append(record)
-            print(f"Epoch {epoch+1}/{EPOCHS_COUNT} | "
-                  f"Train Loss: {train_loss:.4f} (seg {ep_seg:.4f} + "
-                  f"{ep_w:.2f}·topo {ep_topo:.4f})"
-                  f"{topo_str} | Left approx {time_left_str}")
-
-        if SELECT_BEST_CHECKPOINT and (best_state_dice is not None or band_state is not None):
-            use_band = (
-                TOPO_AWARE_SELECTION
-                and band_state is not None
-                and band_dice >= best_dice - SELECTION_DICE_TOL
-            )
-            if use_band:
-                chosen, why = band_state, (
-                    f"topology-aware (Dice {band_dice:.4f} в полосе "
-                    f"best-{SELECTION_DICE_TOL}, min TopoErr {band_topo:.3f})"
-                )
-            else:
-                chosen, why = best_state_dice, f"best val Dice {best_dice:.4f}"
-            self.model.load_state_dict(chosen)
-            print(f"[checkpoint] восстановлены веса: {why}")
-
+            if val_loader is not None:
+                score = self._validation_score(val_loader)
+                row["inner_patch_foreground_dice"] = score
+                if save_best and score > best_score:
+                    best_score, self.selected_epoch = score, epoch + 1
+                    best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+            self.history.append(row)
+            if on_epoch_end is not None:
+                on_epoch_end(self.history)
+            remaining = (time.time() - start) / (epoch + 1) * (EPOCHS_COUNT - epoch - 1)
+            print(f"Epoch {epoch+1}/50 | loss={row['train_loss']:.4f} | left={remaining/60:.1f} min")
+        if save_best:
+            self.model.load_state_dict(best_state)
+        else:
+            self.selected_epoch = EPOCHS_COUNT
         self.is_fitted = True
+        return self
 
-    # ------------------------------------------------------------------
-    def predict(self, images: torch.Tensor) -> torch.Tensor:
+    @torch.inference_mode()
+    def predict_proba(self, images, tta=False):
         self.model.eval()
-        with torch.no_grad():
-            images = images.to(settings.DEVICE, non_blocking=True)
-            logits = self.model(images)
-            preds = torch.argmax(logits, dim=1)
-        return preds.cpu()
+        if images.ndim != 4 or images.shape[1] != 3:
+            raise ValueError("Expected images Bx3xHxW, normalized with MEAN/STD.")
+        images = images.to(self.device, non_blocking=True).float()
+        variants = ((), (-1,), (-2,), (-2, -1)) if tta else ((),)
+        accumulated = None
+        for dims in variants:
+            transformed = torch.flip(images, dims) if dims else images
+            probs = self.model(transformed).float().softmax(1)
+            if dims:
+                probs = torch.flip(probs, dims)
+            accumulated = probs if accumulated is None else accumulated + probs
+        return (accumulated / len(variants)).cpu()
 
-    def predict_logits(self, images: torch.Tensor) -> torch.Tensor:
-        self.model.eval()
-        with torch.no_grad():
-            images = images.to(settings.DEVICE, non_blocking=True)
-            return self.model(images).cpu()
+    def predict(self, images):
+        return self.predict_proba(images).argmax(1)
 
     def save(self, path):
+        if not self.is_fitted:
+            raise RuntimeError("Cannot save an unfitted model.")
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
         torch.save({
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "num_classes": NUM_CLASSES,
-            "LEARNING_RATE": self.LEARNING_RATE,
-            "encoder_name": ENCODER_NAME,
-            "class_weights": self.class_weights.detach().cpu(),
-            "history": self.history,
-            "topo_config": {
-                "weight": TOPO_WEIGHT,
-                "warmup_epochs": TOPO_WARMUP_EPOCHS,
-                "ramp_epochs": TOPO_RAMP_EPOCHS,
-                "value_mode": TOPO_VALUE_MODE,
-                "gradient_mode": TOPO_GRADIENT_MODE,
-                "weight_temperature": TOPO_WEIGHT_TEMPERATURE,
-                "absent_class_scale": TOPO_ABSENT_CLASS_SCALE,
-                "union_weight": TOPO_UNION_WEIGHT,
-                "reduction": TOPO_REDUCTION,
-            },
-        }, path)
+            "format_version": 2,
+            "model_state_dict": {k: v.detach().cpu() for k, v in self.model.state_dict().items()},
+            "num_classes": NUM_CLASSES, "encoder_name": ENCODER_NAME,
+            "encoder_weights": self.encoder_weights,
+            "trained_epochs": self.trained_epochs, "selected_epoch": self.selected_epoch,
+            "class_counts": self.class_counts,
+            "class_weights": self.class_weights.detach().cpu() if self.class_weights is not None else None,
+            "union_coef": self.union_coef, "topology_coef": self.topology_coef,
+            "metadata": self.metadata,
+        }, temporary)
+        temporary.replace(path)
 
-    def load(self, path):
-        checkpoint = torch.load(path, map_location=settings.DEVICE)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        if "optimizer_state_dict" in checkpoint:
-            try:
-                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            except Exception:
-                pass
-        self.history = checkpoint.get("history", [])
+    def load(self, path, expected_protocol=None):
+        # weights_only prevents arbitrary code execution from pickled checkpoints.
+        checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+        if checkpoint.get("format_version") != 2:
+            raise ValueError("Expected new-format checkpoint v2; original baseline files are not accepted.")
+        if checkpoint.get("num_classes") != NUM_CLASSES:
+            raise ValueError("Checkpoint class count mismatch.")
+        if checkpoint.get("encoder_name") != ENCODER_NAME:
+            raise ValueError("Checkpoint encoder mismatch.")
+        metadata = checkpoint.get("metadata", {})
+        if expected_protocol is not None and metadata.get("protocol_sha256") != expected_protocol:
+            raise ValueError("Checkpoint dataset/split/configuration differs from this run.")
+        self.model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+        self.metadata = metadata
+        self.trained_epochs = checkpoint.get("trained_epochs", 0)
+        self.selected_epoch = checkpoint.get("selected_epoch")
+        self.class_counts = checkpoint.get("class_counts")
+        weights = checkpoint.get("class_weights")
+        self.class_weights = weights.to(self.device) if weights is not None else None
+        self.union_coef = checkpoint.get("union_coef", self.union_coef)
+        self.topology_coef = checkpoint.get("topology_coef", self.topology_coef)
+        self.encoder_weights = checkpoint.get("encoder_weights")
         self.is_fitted = True
+        return self
 
-    # ------------------------------------------------------------------
     @staticmethod
     def get_model_save_path(fold_num: int) -> pathlib.Path:
-        return pathlib.Path(f"UNETPP_WCD/weights_{fold_num}_patches_overlap.pth")
+        return settings.OUTPUT_DIR / f"weights_{fold_num}_patches_overlap.pth"
 
     @staticmethod
     def get_interval_metrics_save_path() -> pathlib.Path:
-        return pathlib.Path("UNETPP_WCD/interval_metrics_patches_overlap.csv")
+        return settings.OUTPUT_DIR / ("evaluation_tta" if settings.USE_TTA else "evaluation") / "interval_metrics_patches_overlap.csv"
 
     @staticmethod
     def get_raw_metrics_save_path() -> pathlib.Path:
-        return pathlib.Path("UNETPP_WCD/raw_metrics_patches_overlap.csv")
-
-    @staticmethod
-    def get_training_history_save_path() -> pathlib.Path:
-        return pathlib.Path("UNETPP_WCD/train_history_patches_overlap.csv")
+        return settings.OUTPUT_DIR / ("evaluation_tta" if settings.USE_TTA else "evaluation") / "raw_metrics_patches_overlap.csv"
 
     @staticmethod
     def get_model_name():
-        return 'UNET-WCD-TOPO'
+        return "UNETPP-VESSEL-AWARE"
 
     @staticmethod
     def get_val_viz_path():
-        return pathlib.Path('UNETPP_WCD/val_viz_patches_overlap')
+        return settings.OUTPUT_DIR / ("evaluation_tta" if settings.USE_TTA else "evaluation") / "visualizations"

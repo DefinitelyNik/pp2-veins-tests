@@ -14,6 +14,7 @@ from PIL import Image
 from scipy import stats
 
 from common import settings_patches_overlap as settings
+from common.experiment_utils_overlap import strict_rgb_to_labels, read_rgb
 
 
 # ---------------------------------------------------------------------------
@@ -37,13 +38,7 @@ def parse_patch_name(stem: str) -> Tuple[str, int, int]:
 
 def color_mask_to_index(mask_rgb: np.ndarray, color_map: Dict[int, list]) -> np.ndarray:
     """RGB-маска (H,W,3) -> индексы классов (H,W) uint8."""
-    h, w, _ = mask_rgb.shape
-    out = np.zeros((h, w), dtype=np.uint8)
-    for cls, color in color_map.items():
-        arr = np.array(color, dtype=mask_rgb.dtype)
-        m = np.all(mask_rgb == arr, axis=-1)
-        out[m] = cls
-    return out
+    return strict_rgb_to_labels(mask_rgb, color_map)
 
 
 # ---------------------------------------------------------------------------
@@ -55,14 +50,17 @@ def iter_patch_coords(H: int, W: int, patch: int, stride: int):
     покрывающих изображение HxW. Логика та же, что в скрипте нарезки:
     последний патч добивается до края, если сетка не попадает точно.
     """
-    ys = list(range(0, H - patch + 1, stride))
-    xs = list(range(0, W - patch + 1, stride))
-    if ys[-1] + patch < H:
-        ys.append(H - patch)
-    if xs[-1] + patch < W:
-        xs.append(W - patch)
-    for y in ys:
-        for x in xs:
+    if H < 1 or W < 1 or patch < 1 or not 0 < stride <= patch:
+        raise ValueError("Require positive image sizes and 0 < stride <= patch.")
+    def starts(length):
+        if length <= patch:
+            return [0]
+        result = list(range(0, length - patch + 1, stride))
+        if result[-1] != length - patch:
+            result.append(length - patch)
+        return result
+    for y in starts(H):
+        for x in starts(W):
             yield y, x
 
 
@@ -92,8 +90,10 @@ def reconstruct_from_patches(
     """
     if priority_order is None:
         priority_order = [3, 1, 2, 4, 0]
-    assert set(priority_order) == set(range(num_classes)), \
-        f"priority_order должен содержать все {num_classes} классов"
+    if sorted(priority_order) != list(range(num_classes)):
+        raise ValueError("priority_order must contain each class exactly once.")
+    if len(patch_preds) != len(patch_names):
+        raise ValueError("Different numbers of predictions and patch names.")
 
     votes = np.zeros((num_classes, full_h, full_w), dtype=np.int32)
     coverage = np.zeros((full_h, full_w), dtype=np.int32)
@@ -120,6 +120,7 @@ def reconstruct_from_patches(
     idx = np.argmax(votes_perm, axis=0)
     full_pred = np.array(priority_order, dtype=np.uint8)[idx]
 
+    full_pred[coverage == 0] = 0
     return full_pred, coverage
 
 
@@ -129,8 +130,14 @@ def reconstruct_from_patches(
 def _confusion_matrix_np(preds: np.ndarray, targets: np.ndarray,
                          num_classes: int) -> np.ndarray:
     """Быстрая confusion matrix без sklearn."""
+    if preds.shape != targets.shape:
+        raise ValueError("Prediction/target shape mismatch.")
+    if not np.issubdtype(preds.dtype, np.integer) or not np.issubdtype(targets.dtype, np.integer):
+        raise ValueError("Confusion matrix inputs must be integer label maps.")
     mask = (targets >= 0) & (targets < num_classes) & \
            (preds >= 0) & (preds < num_classes)
+    if not mask.all():
+        raise ValueError("Invalid labels: refusing to silently discard pixels.")
     idx = targets[mask].astype(np.int64) * num_classes + preds[mask].astype(np.int64)
     cm = np.bincount(idx, minlength=num_classes * num_classes)
     return cm.reshape(num_classes, num_classes)
@@ -189,108 +196,154 @@ def get_all_metrics_from_cm(cm: np.ndarray,
                             class_names: Dict[int, str]) -> Dict[str, float]:
     per_class = compute_per_class_dice_iou(cm, class_names)
     per_class.update(compute_per_class_accuracy_precision_recall(cm, class_names))
+    macro_dice, macro_iou = compute_macro_dice_iou(cm)
+    per_class["macro_dice_all"] = macro_dice
+    per_class["macro_iou_all"] = macro_iou
+    tp = np.diag(cm).astype(np.float64)
+    fp, fn = cm.sum(0) - tp, cm.sum(1) - tp
+    dice = 2 * tp / (2 * tp + fp + fn + 1e-8)
+    iou = tp / (tp + fp + fn + 1e-8)
+    per_class["foreground_macro_dice"] = float(dice[1:].mean())
+    per_class["foreground_macro_iou"] = float(iou[1:].mean())
+    vessel_tp = float(cm[1:, 1:].sum())
+    vessel_fp, vessel_fn = float(cm[0, 1:].sum()), float(cm[1:, 0].sum())
+    per_class["vessel_union_dice"] = 2 * vessel_tp / (2 * vessel_tp + vessel_fp + vessel_fn + 1e-8)
+    per_class["vessel_union_iou"] = vessel_tp / (vessel_tp + vessel_fp + vessel_fn + 1e-8)
     return per_class
 
 
 # ---------------------------------------------------------------------------
 # Оценка фолда по восстановленным изображениям
 # ---------------------------------------------------------------------------
+def make_blending_window(patch_size):
+    axis = np.hanning(patch_size).astype(np.float32)
+    return np.maximum(np.outer(axis, axis), 1e-3).astype(np.float32)
+
+
+def binary_topology_metrics(pred, target):
+    """Hard metrics, not the differentiable training surrogate.
+
+    8-connectivity; HD95 = percentile of pooled bidirectional surface
+    distances in pixels at evaluated resolution. No small-component removal.
+    Empty/empty: clDice=1, HD95=0; exactly one empty: clDice=0, HD95=NaN.
+    """
+    from scipy import ndimage as ndi
+    from skimage.morphology import skeletonize
+    pred, target = pred.astype(bool), target.astype(bool)
+    structure = np.ones((3, 3), dtype=bool)
+    components_pred = int(ndi.label(pred, structure)[1])
+    components_gt = int(ndi.label(target, structure)[1])
+    result = {"components_pred": components_pred, "components_gt": components_gt}
+    if not pred.any() or not target.any():
+        both_empty = not pred.any() and not target.any()
+        result.update(cldice=float(both_empty), hd95_px=0.0 if both_empty else np.nan)
+        return result
+    skel_pred, skel_gt = skeletonize(pred), skeletonize(target)
+    precision = float(target[skel_pred].mean())
+    recall = float(pred[skel_gt].mean())
+    result["cldice"] = 2 * precision * recall / (precision + recall + 1e-8)
+    surface_pred = pred & ~ndi.binary_erosion(pred, structure, border_value=0)
+    surface_gt = target & ~ndi.binary_erosion(target, structure, border_value=0)
+    d_gt = ndi.distance_transform_edt(~surface_gt)
+    distances_pred = d_gt[surface_pred]
+    del d_gt
+    d_pred = ndi.distance_transform_edt(~surface_pred)
+    distances_gt = d_pred[surface_gt]
+    result["hd95_px"] = float(np.percentile(
+        np.concatenate([distances_pred, distances_gt]), 95
+    ))
+    return result
+
+
 def evaluate_fold_overlap(
-    model,
-    val_source_keys: List[str],
-    normalized_img_dir: Path,
-    normalized_msk_dir: Path,
-    num_classes: int,
-    color_map: Dict[int, list],
-    class_names: Dict[int, str],
-    val_extra_transforms,                # <-- новый аргумент
-    patch_size: int = 256,
-    stride: int = 128,
-    priority_order: Optional[List[int]] = None,
-    batch_size: int = 8,
-    verbose: bool = True,
-) -> Tuple[Dict[str, float], Dict[str, np.ndarray]]:
+    model, val_source_keys, normalized_img_dir, normalized_msk_dir,
+    num_classes, color_map, class_names, val_extra_transforms,
+    patch_size=256, stride=128, priority_order=None, batch_size=8,
+    verbose=True, tta=False, per_image_records=None, visualization_dir=None,
+    fold_num=None, keep_visualizations=True, compute_topology=True,
+    patient_groups=None, confusion_matrix_path=None,
+):
+    """Probability blending; optional streaming visualizations and per-image CSV data.
+
+    priority_order is retained for signature compatibility but is not applied.
+    Returns (pixel-pooled fold metrics, optional visualizations). Topology is
+    computed per image and saved into per_image_records, not pixel-pooled.
+    """
     import torch
-
-    if priority_order is None:
-        priority_order = [3, 1, 2, 4, 0]
-
-    # Тот же transform, что и в _make_val_loader
-    val_transform = A.Compose([*val_extra_transforms, ToTensorV2()])
-
+    import warnings
+    if priority_order is not None:
+        warnings.warn("priority_order ignored: probability blending has no class priority.")
+    if not val_source_keys or len(set(val_source_keys)) != len(val_source_keys):
+        raise ValueError("Validation sources must be nonempty and unique.")
+    if batch_size < 1 or patch_size % 32 or not 0 < stride <= patch_size:
+        raise ValueError("Invalid inference patch, stride or batch size.")
+    if not hasattr(model, "predict_proba"):
+        raise TypeError("Probability blending requires model.predict_proba().")
+    normalized_img_dir, normalized_msk_dir = Path(normalized_img_dir), Path(normalized_msk_dir)
+    transform = A.Compose([*(val_extra_transforms or []), ToTensorV2()])
+    window = make_blending_window(patch_size)
     cm_total = np.zeros((num_classes, num_classes), dtype=np.int64)
-    visualizations: Dict[str, np.ndarray] = {}
-
-    for src in val_source_keys:
-        img_path = normalized_img_dir / f"{src}.png"
-        msk_path = normalized_msk_dir / f"{src}.png"
-        if not img_path.exists():
-            raise FileNotFoundError(f"Нет исходного изображения {img_path}")
-        if not msk_path.exists():
-            raise FileNotFoundError(f"Нет исходной маски {msk_path}")
-
-        img_rgb = np.array(Image.open(img_path).convert("RGB"))  # (H,W,3) uint8
-        gt_rgb = np.array(Image.open(msk_path).convert("RGB"))
-        H, W = img_rgb.shape[:2]
-        if gt_rgb.shape[:2] != (H, W):
-            raise RuntimeError(
-                f"{src}: размер изображения {img_rgb.shape[:2]} != "
-                f"размер маски {gt_rgb.shape[:2]}"
-            )
-        gt_idx = color_mask_to_index(gt_rgb, color_map)
-
-        coords = list(iter_patch_coords(H, W, patch_size, stride))
-
-        patch_names: List[str] = []
-        patch_preds: List[np.ndarray] = []
-
-        for i in range(0, len(coords), batch_size):
-            batch_coords = coords[i:i + batch_size]
-
-            batch_imgs = []
-            for (y, x) in batch_coords:
-                im = img_rgb[y:y + patch_size, x:x + patch_size]
-                batch_imgs.append(im)
-            batch_arr = np.stack(batch_imgs, axis=0)  # (B, ps, ps, 3) uint8
-
-            # --- прогон через тот же transform, что в val_loader ---
-            tensors = []
-            for b in range(batch_arr.shape[0]):
-                out = val_transform(image=batch_arr[b])
-                tensors.append(out["image"])            # (3, ps, ps) float32
-            tensor = torch.stack(tensors, dim=0)        # (B, 3, ps, ps)
-            # ------------------------------------------------------
-
-            # predict сам делает eval/no_grad/to(settings.DEVICE)
-            preds = model.predict(tensor)  # (B, ps, ps) на CPU
-
-            if preds.dim() == 4:
-                preds = preds.argmax(dim=1)
-            preds = preds.detach().cpu().numpy().astype(np.uint8)
-
-            for (y, x), p in zip(batch_coords, preds):
-                patch_names.append(f"{src}_y{y}_x{x}")
-                patch_preds.append(p)
-
-        full_pred, coverage = reconstruct_from_patches(
-            patch_preds, patch_names, H, W, num_classes, priority_order
-        )
-
-        if (coverage == 0).any():
-            n_zero = int((coverage == 0).sum())
-            raise RuntimeError(
-                f"{src}: {n_zero} пикселей без покрытия — сломался "
-                f"iter_patch_coords или patch_size/stride"
-            )
-
-        cm_total += _confusion_matrix_np(full_pred, gt_idx, num_classes)
-        visualizations[src] = (full_pred, gt_idx)
-
-    if verbose:
-        print(f"  обработано val-источников: {len(val_source_keys)}")
-
-    metrics = get_all_metrics_from_cm(cm_total, class_names)
-    return metrics, visualizations
+    visualizations = {}
+    for source in val_source_keys:
+        rgb = read_rgb(normalized_img_dir / f"{source}.png")
+        gt_rgb = read_rgb(normalized_msk_dir / f"{source}.png")
+        if rgb.shape != gt_rgb.shape:
+            raise ValueError(f"Source image/mask dimensions differ: {source}")
+        gt = color_mask_to_index(gt_rgb, color_map)
+        h, w = rgb.shape[:2]
+        padded = np.pad(rgb, ((0, max(0, patch_size-h)),
+                             (0, max(0, patch_size-w)), (0, 0)), mode="edge")
+        ph, pw = padded.shape[:2]
+        coords = list(iter_patch_coords(ph, pw, patch_size, stride))
+        probability_sum = np.zeros((num_classes, ph, pw), dtype=np.float32)
+        weight_sum = np.zeros((ph, pw), dtype=np.float32)
+        for start in range(0, len(coords), batch_size):
+            batch_coords = coords[start:start + batch_size]
+            tensors = [transform(image=padded[y:y+patch_size, x:x+patch_size])["image"]
+                       for y, x in batch_coords]
+            tensor = torch.stack(tensors).float()
+            probs = model.predict_proba(tensor, tta=tta).detach().cpu().numpy()
+            expected = (len(batch_coords), num_classes, patch_size, patch_size)
+            if probs.shape != expected or not np.isfinite(probs).all():
+                raise ValueError(f"Invalid probabilities: shape={probs.shape}, expected={expected}")
+            if np.any(probs < -1e-5) or np.any(probs > 1 + 1e-5) or not np.allclose(probs.sum(1), 1, atol=1e-4):
+                raise ValueError("predict_proba must return normalized softmax probabilities.")
+            for (y, x), patch_probs in zip(batch_coords, probs):
+                probability_sum[:, y:y+patch_size, x:x+patch_size] += patch_probs * window[None]
+                weight_sum[y:y+patch_size, x:x+patch_size] += window
+        if np.any(weight_sum <= 0):
+            raise RuntimeError(f"Uncovered image pixels: {source}")
+        probability_sum /= weight_sum[None]
+        prediction = probability_sum[:, :h, :w].argmax(0).astype(np.uint8)
+        del probability_sum, weight_sum, padded
+        cm = _confusion_matrix_np(prediction, gt, num_classes)
+        cm_total += cm
+        row = {"source_key": source, "fold": fold_num,
+               "patient_id": (patient_groups or {}).get(source, source),
+               "height": h, "width": w}
+        row.update(get_all_metrics_from_cm(cm, class_names))
+        if compute_topology:
+            for name, pred_binary, target_binary in (
+                ("vessel_union", prediction > 0, gt > 0),
+                ("arteries", prediction == 1, gt == 1),
+                ("veins", prediction == 2, gt == 2),
+            ):
+                row.update({f"{name}_{key}": value for key, value in
+                            binary_topology_metrics(pred_binary, target_binary).items()})
+        if per_image_records is not None:
+            per_image_records.append(row)
+        if keep_visualizations:
+            visualizations[source] = (prediction, gt)
+        if visualization_dir is not None:
+            prefix = f"fold{fold_num}_" if fold_num is not None else ""
+            save_visualization(prediction, gt, Path(visualization_dir) / f"{prefix}{source}.png", color_map)
+        if verbose:
+            print(f"[eval] {source}: {len(coords)} patches, foreground Dice={row['foreground_macro_dice']:.4f}")
+    if confusion_matrix_path is not None:
+        path = Path(confusion_matrix_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, cm_total)
+    return get_all_metrics_from_cm(cm_total, class_names), visualizations
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +351,9 @@ def evaluate_fold_overlap(
 # ---------------------------------------------------------------------------
 def get_interval_metrics_from_raw(metrics_df: pd.DataFrame,
                                   confidence_level: float = 0.95) -> pd.DataFrame:
+    import warnings
+    warnings.warn("Legacy t-interval over folds: descriptive only, folds are not independent. "
+                  "Use bootstrap_per_image for conditional image/group uncertainty.")
     alpha = 1 - confidence_level
     n = len(metrics_df)
     if n < 2:
@@ -315,6 +371,49 @@ def get_interval_metrics_from_raw(metrics_df: pd.DataFrame,
             "lower_bound": mean_val - margin,
             "average": mean_val,
             "upper_bound": mean_val + margin,
+        })
+    return pd.DataFrame(results)
+
+
+def bootstrap_per_image(frame, confidence_level=0.95, samples=2000, seed=42):
+    """Percentile cluster bootstrap of mean per-image OOF metrics.
+
+    Groups are patient IDs if supplied, otherwise source image IDs. Conditional
+    on these trained models/splits; does NOT measure training-seed uncertainty.
+    NaNs (undefined HD95 for one-empty masks) are excluded per metric and counted.
+    """
+    if not 0 < confidence_level < 1 or samples < 1 or frame.empty:
+        raise ValueError("Invalid bootstrap parameters or empty input.")
+    excluded = {"fold", "height", "width", "source_key", "patient_id"}
+    columns = [c for c in frame.select_dtypes(include=[np.number]).columns if c not in excluded]
+    values = frame[columns].to_numpy(dtype=np.float64)
+    identifiers = frame["patient_id"].astype(str).to_numpy()
+    unique = sorted(set(identifiers))
+    groups = [np.flatnonzero(identifiers == identifier) for identifier in unique]
+    rng = np.random.default_rng(seed)
+    def means(array):
+        finite = np.isfinite(array)
+        counts = finite.sum(0)
+        sums = np.where(finite, array, 0).sum(0)
+        return np.divide(sums, counts, out=np.full(len(columns), np.nan), where=counts > 0)
+    estimates = np.empty((samples, len(columns)), dtype=np.float64)
+    for index in range(samples):
+        chosen = rng.integers(0, len(groups), size=len(groups))
+        rows = np.concatenate([groups[g] for g in chosen])
+        estimates[index] = means(values[rows])
+    alpha = (1 - confidence_level) / 2
+    average = means(values)
+    results = []
+    for index, column in enumerate(columns):
+        valid = estimates[:, index][np.isfinite(estimates[:, index])]
+        low, high = np.quantile(valid, [alpha, 1-alpha]) if len(valid) else (np.nan, np.nan)
+        results.append({
+            "metric_name": column, "average": average[index],
+            "lower_bound": low, "upper_bound": high,
+            "valid_images": int(np.isfinite(values[:, index]).sum()),
+            "undefined_images": int((~np.isfinite(values[:, index])).sum()),
+            "groups": len(groups), "bootstrap_samples": samples,
+            "scope": "conditional_mean_per_image_oof_cluster_bootstrap",
         })
     return pd.DataFrame(results)
 
