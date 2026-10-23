@@ -86,6 +86,10 @@ def main(argv=None):
                         help="Evaluate matching new-format checkpoints without downloading ImageNet weights.")
     parser.add_argument("--overwrite", action="store_true",
                         help="Explicitly allow replacing an existing run (no automatic resume).")
+    parser.add_argument("--baseline-sampler", action="store_true",
+                        help="Disable rare-class sampling; default to original vessel_aware_50ep output.")
+    parser.add_argument("--output-dir", type=Path, default=None,
+                        help="Optional separate run directory; never reuse baseline weights for rare sampling.")
     parser.add_argument("--no-visualize", action="store_true")
     parser.add_argument("--no-topology-metrics", action="store_true",
                         help="Skip CPU hard skeleton/HD95 evaluation; training loss is unchanged.")
@@ -94,6 +98,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.use_fitted and args.overwrite:
         parser.error("--use-fitted and --overwrite are mutually exclusive.")
+    if args.baseline_sampler:
+        settings.RARE_SAMPLER_ENABLED = False
+        if args.output_dir is None:
+            settings.OUTPUT_DIR = settings.BASE_DIR / "UNETPP_WCD" / "runs" / "vessel_aware_50ep"
+    if args.output_dir is not None:
+        settings.OUTPUT_DIR = args.output_dir.expanduser().resolve()
 
     settings.validate_settings()
     seed_everything(settings.SEED)
@@ -157,8 +167,20 @@ def main(argv=None):
         else:
             model.metadata = manifest
             write_json(output / f"fold_{fold}_manifest.json", manifest)
-            def log_history(history, current_fold=fold):
+            sampler = getattr(train_loader, "sampler", None)
+            if hasattr(sampler, "audit_records"):
+                save_csv(pd.DataFrame(sampler.audit_records()),
+                         output / f"fold_{fold}_sampler_audit.csv")
+                write_json(output / f"fold_{fold}_sampler_config.json", sampler.protocol_config)
+            source_sampling_history = []
+            def log_history(history, current_fold=fold, current_sampler=sampler,
+                            source_rows=source_sampling_history):
                 save_csv(pd.DataFrame(history), output / f"fold_{current_fold}_history.csv")
+                records = getattr(current_sampler, "last_source_records", [])
+                if records:
+                    source_rows.extend(records)
+                    save_csv(pd.DataFrame(source_rows),
+                             output / f"fold_{current_fold}_sampling_by_source.csv")
             # Outer validation is NOT used for checkpoint selection.
             model.fit(train_loader, val_loader=None, save_best=False,
                       on_epoch_end=log_history)

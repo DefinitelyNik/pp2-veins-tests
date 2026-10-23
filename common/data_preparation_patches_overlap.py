@@ -9,7 +9,7 @@ from typing import Optional, List
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 from PIL import Image
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -212,6 +212,183 @@ def _generator(seed):
     generator.manual_seed(seed)
     return generator
 
+class RareClassMixSampler(Sampler):
+    """Fixed-length, train-only mixture with source-balanced targeted draws.
+
+    Uniform slots use a shuffled subset without replacement. Targeted slots
+    sample a source uniformly, then a positive patch in it. Categories may
+    overlap. Patch/source caps include every draw, including uniform slots.
+    A missing/exhausted target pool falls back to available training patches.
+    No image or mask from the outer validation set is inspected here.
+    """
+
+    def __init__(self, image_paths, mask_paths, seed, fractions=None,
+                 min_pixels=None, max_patch_repeats=None, max_source_multiplier=None):
+        super().__init__()
+        self.image_paths = [Path(p) for p in image_paths]
+        self.mask_paths = [Path(p) for p in mask_paths]
+        if not self.image_paths or len(self.image_paths) != len(self.mask_paths):
+            raise ValueError("Sampler requires nonempty paired training paths.")
+        self.seed, self.epoch = int(seed), 0
+        self.fractions = dict(settings.RARE_CLASS_FRACTIONS if fractions is None else fractions)
+        self.min_pixels = settings.RARE_MIN_PIXELS if min_pixels is None else min_pixels
+        self.max_patch_repeats = (settings.RARE_MAX_PATCH_REPEATS
+                                  if max_patch_repeats is None else max_patch_repeats)
+        self.max_source_multiplier = (settings.RARE_MAX_SOURCE_MULTIPLIER
+                                     if max_source_multiplier is None else max_source_multiplier)
+        if (not self.fractions or any(c not in range(1, settings.NUM_CLASSES)
+                                     for c in self.fractions)
+                or any(not np.isfinite(v) or not 0 < v < 1 for v in self.fractions.values())
+                or sum(self.fractions.values()) >= 1
+                or not isinstance(self.min_pixels, int) or self.min_pixels < 1
+                or not isinstance(self.max_patch_repeats, int) or self.max_patch_repeats < 1
+                or not np.isfinite(self.max_source_multiplier) or self.max_source_multiplier < 1):
+            raise ValueError("Invalid rare-class sampler configuration.")
+        self.source_keys = sorted({_source_key(p) for p in self.image_paths})
+        source_lookup = {key: i for i, key in enumerate(self.source_keys)}
+        self.source_ids = np.array([source_lookup[_source_key(p)] for p in self.image_paths])
+        self.source_patch_counts = np.bincount(self.source_ids, minlength=len(self.source_keys))
+        self.source_caps = np.ceil(self.source_patch_counts * self.max_source_multiplier).astype(np.int64)
+        counts = []
+        for path in self.mask_paths:
+            with Image.open(path) as opened:
+                labels = strict_rgb_to_labels(np.array(opened.convert("RGB")))
+            counts.append(np.bincount(labels.ravel(), minlength=settings.NUM_CLASSES))
+        self.patch_class_counts = np.asarray(counts, dtype=np.int64)
+        self.target_indices = {
+            c: np.flatnonzero(self.patch_class_counts[:, c] >= self.min_pixels)
+            for c in sorted(self.fractions)
+        }
+        self.last_epoch_stats = {}
+        self.last_source_records = []
+        self._cached_epoch, self._cached_indices = None, None
+        for c, indices in self.target_indices.items():
+            print(f"[rare sampler] class={settings.CLASS_NAMES[c]}: "
+                  f"positive patches={len(indices)}, "
+                  f"sources={len(np.unique(self.source_ids[indices]))}")
+            if not len(indices):
+                import warnings
+                warnings.warn(f"No eligible training patches for class {c}; use fallback slots.")
+
+    @property
+    def protocol_config(self):
+        return {
+            "name": "rare_class_mixture_v1", "seed": self.seed,
+            "fractions": {str(c): float(v) for c, v in sorted(self.fractions.items())},
+            "min_pixels": int(self.min_pixels),
+            "max_patch_repeats": int(self.max_patch_repeats),
+            "max_source_multiplier": float(self.max_source_multiplier),
+            "num_samples_per_epoch": len(self),
+            "uniform": "random_subset_without_replacement_first",
+            "targeted": "uniform_source_then_uniform_positive_patch_with_caps",
+            "fallback": "source_balanced_available_training_patches",
+            "target_order": sorted(self.fractions),
+            "quota_rounding": "floor_each_target_remainder_to_uniform",
+        }
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def set_epoch(self, epoch):
+        if int(epoch) < 0:
+            raise ValueError("Epoch must be nonnegative.")
+        self.epoch = int(epoch)
+
+    def audit_records(self):
+        rows = []
+        for i, path in enumerate(self.image_paths):
+            row = {"patch": path.name, "source_key": self.source_keys[self.source_ids[i]]}
+            for c in range(settings.NUM_CLASSES):
+                row[f"pixels_{settings.CLASS_NAMES[c]}"] = int(self.patch_class_counts[i, c])
+            for c in self.target_indices:
+                row[f"eligible_{settings.CLASS_NAMES[c]}"] = int(
+                    self.patch_class_counts[i, c] >= self.min_pixels)
+            rows.append(row)
+        return rows
+
+    def __iter__(self):
+        # Re-iterating the same epoch is idempotent (e.g. when inspecting a loader).
+        if self._cached_epoch == self.epoch:
+            return iter(self._cached_indices)
+        generator = _generator(self.seed + 1000003 * (self.epoch + 1))
+        n = len(self)
+        requested = {c: int(n * self.fractions[c]) for c in sorted(self.fractions)}
+        uniform_n = n - sum(requested.values())
+        chosen = torch.randperm(n, generator=generator)[:uniform_n].tolist()
+        patch_draws = np.bincount(chosen, minlength=n).astype(np.int64)
+        source_draws = np.bincount(self.source_ids[chosen], minlength=len(self.source_keys)).astype(np.int64)
+
+        def draw_from_pool(indices, amount):
+            groups = {}
+            for index in indices:
+                index = int(index)
+                source = int(self.source_ids[index])
+                if (patch_draws[index] < self.max_patch_repeats
+                        and source_draws[source] < self.source_caps[source]):
+                    groups.setdefault(source, []).append(index)
+            active_sources = sorted(groups)
+            drawn = []
+            while len(drawn) < amount and active_sources:
+                source_slot = int(torch.randint(len(active_sources), (1,), generator=generator).item())
+                source = active_sources[source_slot]
+                pool = groups[source]
+                slot = int(torch.randint(len(pool), (1,), generator=generator).item())
+                index = pool[slot]
+                drawn.append(index)
+                patch_draws[index] += 1
+                source_draws[source] += 1
+                if patch_draws[index] >= self.max_patch_repeats:
+                    pool[slot] = pool[-1]
+                    pool.pop()
+                if not pool or source_draws[source] >= self.source_caps[source]:
+                    active_sources[source_slot] = active_sources[-1]
+                    active_sources.pop()
+            return drawn
+
+        delivered = {}
+        for c, amount in requested.items():
+            targeted = draw_from_pool(self.target_indices[c], amount)
+            delivered[c] = len(targeted)
+            chosen.extend(targeted)
+        fallback_n = n - len(chosen)
+        chosen.extend(draw_from_pool(np.arange(n), fallback_n))
+        if len(chosen) != n:
+            raise RuntimeError("Sampler exhausted total capacity; check repeat/source caps.")
+        order = torch.randperm(n, generator=generator).tolist()
+        chosen = [chosen[i] for i in order]
+        selected = np.asarray(chosen, dtype=np.int64)
+        stats = {
+            "sampling_draws": n, "sampling_uniform_slots": uniform_n,
+            "sampling_fallback_slots": fallback_n,
+            "sampling_unique_patches": int(np.count_nonzero(patch_draws)),
+            "sampling_unique_fraction": float(np.count_nonzero(patch_draws) / n),
+            "sampling_max_patch_repeats": int(patch_draws.max()),
+            "sampling_max_source_ratio": float(np.max(source_draws / self.source_patch_counts)),
+        }
+        for c in range(settings.NUM_CLASSES):
+            name = settings.CLASS_NAMES[c]
+            stats[f"sampling_positive_fraction_{name}"] = float(
+                np.mean(self.patch_class_counts[selected, c] > 0))
+            stats[f"sampling_pixels_{name}"] = int(self.patch_class_counts[selected, c].sum())
+        for c in requested:
+            name = settings.CLASS_NAMES[c]
+            stats[f"sampling_requested_{name}"] = requested[c]
+            stats[f"sampling_targeted_{name}"] = delivered[c]
+        self.last_epoch_stats = stats
+        self.last_source_records = []
+        for source, key in enumerate(self.source_keys):
+            positions = self.source_ids == source
+            self.last_source_records.append({
+                "epoch": self.epoch + 1, "source_key": key,
+                "available_patches": int(self.source_patch_counts[source]),
+                "draws": int(source_draws[source]), "draw_cap": int(self.source_caps[source]),
+                "unique_patches": int(np.count_nonzero(patch_draws[positions])),
+                "max_patch_repeats": int(patch_draws[positions].max()),
+            })
+        self._cached_epoch, self._cached_indices = self.epoch, chosen
+        return iter(chosen)
+
+
 def _make_train_loader(
     img_paths: List[Path],
     mask_paths: List[Path],
@@ -231,8 +408,13 @@ def _make_train_loader(
     transform = _compose(transforms, seed)
 
     dataset = SegmentationDataset(img_paths, mask_paths, transform=transform)
+    sampler = None
+    if settings.RARE_SAMPLER_ENABLED:
+        sampler = RareClassMixSampler(img_paths, mask_paths, seed=seed)
+        # Raw train-only counts, NOT resampled frequencies: keep CE weights unchanged.
+        dataset.class_pixel_counts = sampler.patch_class_counts.sum(axis=0).copy()
     return DataLoader(
-        dataset, batch_size=bs, shuffle=True, num_workers=nw,
+        dataset, batch_size=bs, shuffle=sampler is None, sampler=sampler, num_workers=nw,
         pin_memory=torch.cuda.is_available(), drop_last=False,
         generator=_generator(seed), worker_init_fn=seed_worker,
     )

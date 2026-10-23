@@ -10,7 +10,7 @@ NORMALIZED_IMG_DIR = BASE_DIR / "normalized_dataset" / "images"
 NORMALIZED_MASK_DIR = BASE_DIR / "normalized_dataset" / "masks"
 
 # Separate output directory: never overwrite the original baseline weights.
-OUTPUT_DIR = BASE_DIR / "UNETPP_WCD" / "runs" / "vessel_aware_50ep"
+OUTPUT_DIR = BASE_DIR / "UNETPP_WCD" / "runs" / "rare_mix_50ep"
 
 # Preserve the ORIGINAL three splits, not a full 5-fold CV.
 FOLDS_NUM = 3
@@ -38,6 +38,15 @@ SKELETON_ITERATIONS = 10
 USE_PHOTOMETRIC_AUG = True
 USE_TTA = False
 BOOTSTRAP_SAMPLES = 2000
+
+# Single-intervention experiment: same network/loss/steps, different train sampler.
+# Fractions reserve DRAW SLOTS, not mutually exclusive positive-class frequencies.
+# Remaining slots use a random subset of ALL training patches without replacement.
+RARE_SAMPLER_ENABLED = True
+RARE_CLASS_FRACTIONS = {3: 0.25, 4: 0.15}
+RARE_MIN_PIXELS = 1  # keep even very small annotated structures eligible
+RARE_MAX_PATCH_REPEATS = 4  # hard per-epoch cap, including the uniform component
+RARE_MAX_SOURCE_MULTIPLIER = 2.0  # at most ceil(2 * original patch count)/source/epoch
 
 # Colors are preserved from the supplied project. Verify against your archive.
 COLOR_MAP = {
@@ -85,3 +94,21 @@ def validate_settings():
         raise ValueError("Invalid CV settings.")
     if UNION_COEF < 0 or TOPOLOGY_COEF < 0 or SKELETON_ITERATIONS < 1:
         raise ValueError("Invalid loss settings.")
+    import math
+    if not isinstance(RARE_SAMPLER_ENABLED, bool):
+        raise ValueError("RARE_SAMPLER_ENABLED must be bool.")
+    if not RARE_CLASS_FRACTIONS or any(
+        not isinstance(c, int) or isinstance(c, bool) or c not in range(1, NUM_CLASSES)
+        for c in RARE_CLASS_FRACTIONS
+    ):
+        raise ValueError("Sampler fractions require valid foreground class IDs.")
+    if any(not math.isfinite(float(v)) or not 0 < float(v) < 1
+           for v in RARE_CLASS_FRACTIONS.values()):
+        raise ValueError("Each targeted sampling fraction must be finite and in (0, 1).")
+    if sum(RARE_CLASS_FRACTIONS.values()) >= 1:
+        raise ValueError("Keep a nonzero uniform sampling component.")
+    if (not isinstance(RARE_MIN_PIXELS, int) or RARE_MIN_PIXELS < 1
+            or not isinstance(RARE_MAX_PATCH_REPEATS, int) or RARE_MAX_PATCH_REPEATS < 1):
+        raise ValueError("Sampler pixel threshold and repeat cap must be positive integers.")
+    if not math.isfinite(RARE_MAX_SOURCE_MULTIPLIER) or RARE_MAX_SOURCE_MULTIPLIER < 1:
+        raise ValueError("Sampler source multiplier must be finite and >= 1.")

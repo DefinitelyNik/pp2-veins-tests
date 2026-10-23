@@ -147,10 +147,18 @@ class ImprovedUNetPlusPlus:
         paths = getattr(train_loader.dataset, "mask_paths", None)
         if paths is None:
             raise TypeError("Expected SegmentationDataset with train-only mask_paths.")
-        counts = np.zeros(NUM_CLASSES, dtype=np.int64)
-        for path in paths:
-            labels = strict_rgb_to_labels(read_rgb(path))
-            counts += np.bincount(labels.ravel(), minlength=NUM_CLASSES)
+        cached = getattr(train_loader.dataset, "class_pixel_counts", None)
+        if cached is None:
+            counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+            for path in paths:
+                labels = strict_rgb_to_labels(read_rgb(path))
+                counts += np.bincount(labels.ravel(), minlength=NUM_CLASSES)
+        else:
+            # Sampler audit already scanned every original training mask once.
+            # Do NOT reweight CE using the oversampled draw distribution.
+            counts = np.asarray(cached, dtype=np.int64).copy()
+            if counts.shape != (NUM_CLASSES,) or np.any(counts < 0):
+                raise ValueError("Invalid cached original-training class counts.")
         if counts.sum() == 0:
             raise ValueError("Empty training masks.")
         present = counts > 0
@@ -217,6 +225,9 @@ class ImprovedUNetPlusPlus:
         start = time.time()
         best_score, best_state = -float("inf"), None
         for epoch in range(EPOCHS_COUNT):
+            sampler = getattr(train_loader, "sampler", None)
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
             self.model.train()
             self.criterion.topology_scale = min(1.0, max(0.0, (epoch - 4) / 10.0))
             total, samples = 0.0, 0
@@ -239,6 +250,7 @@ class ImprovedUNetPlusPlus:
                 "lr": float(self.optimizer.param_groups[0]["lr"]),
                 "topology_scale": self.criterion.topology_scale,
             }
+            row.update(getattr(sampler, "last_epoch_stats", {}))
             if val_loader is not None:
                 score = self._validation_score(val_loader)
                 row["inner_patch_foreground_dice"] = score

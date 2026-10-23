@@ -44,6 +44,81 @@ class OverlapTests(unittest.TestCase):
             path = ROOT / relative
             ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
+    def _sampler_fixture(self, root, missing_uncertain=False, one_rare_patch=False):
+        images, masks = [], []
+        for source in range(4):
+            for patch_index in range(10):
+                name = f"source{source}_y0_x{patch_index * 8}.png"
+                image_path, mask_path = root / "images" / name, root / "masks" / name
+                image_path.parent.mkdir(parents=True, exist_ok=True)
+                mask_path.parent.mkdir(parents=True, exist_ok=True)
+                labels = np.zeros((8, 8), dtype=np.uint8)
+                has_crossing = (source == 0 and patch_index == 0) if one_rare_patch else patch_index in (0, 1)
+                if has_crossing:
+                    labels[1:3, 1:3] = 3
+                if not missing_uncertain and patch_index in (0, 2):
+                    labels[4:6, 4:6] = 4
+                palette = np.array([settings.COLOR_MAP[c] for c in range(5)], dtype=np.uint8)
+                Image.fromarray(palette[labels]).save(mask_path)
+                # Sampler must read masks only: intentionally do not write image files.
+                images.append(image_path)
+                masks.append(mask_path)
+        return images, masks
+
+    def test_rare_sampler_quotas_caps_determinism(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            images, masks = self._sampler_fixture(Path(temporary))
+            sampler = data.RareClassMixSampler(
+                images, masks, seed=123, fractions={3: 0.25, 4: 0.15},
+                min_pixels=1, max_patch_repeats=4, max_source_multiplier=2.0,
+            )
+            sampler.set_epoch(0)
+            first = list(sampler)
+            self.assertEqual(first, list(sampler))
+            self.assertEqual(len(first), 40)
+            self.assertTrue(all(0 <= index < 40 for index in first))
+            draws = np.bincount(first, minlength=40)
+            self.assertLessEqual(draws.max(), 4)
+            sources = np.bincount(sampler.source_ids[first], minlength=4)
+            self.assertTrue(np.all(sources <= sampler.source_caps))
+            stats = sampler.last_epoch_stats
+            self.assertEqual(stats["sampling_uniform_slots"], 24)
+            self.assertEqual(stats["sampling_targeted_crossings"], 10)
+            self.assertEqual(stats["sampling_targeted_uncertain_vessels"], 6)
+            self.assertEqual(stats["sampling_fallback_slots"], 0)
+            self.assertEqual(stats["sampling_unique_patches"], np.count_nonzero(draws))
+            self.assertEqual(sum(row["draws"] for row in sampler.last_source_records), 40)
+            self.assertEqual(len(sampler.audit_records()), 40)
+            second = data.RareClassMixSampler(
+                images, masks, seed=123, fractions={3: 0.25, 4: 0.15},
+                min_pixels=1, max_patch_repeats=4, max_source_multiplier=2.0,
+            )
+            self.assertEqual(first, list(second))
+            sampler.set_epoch(1)
+            self.assertNotEqual(first, list(sampler))
+            second.set_epoch(1)
+            self.assertEqual(list(sampler), list(second))
+
+    def test_rare_sampler_missing_class_and_exhausted_pool(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            images, masks = self._sampler_fixture(
+                Path(temporary), missing_uncertain=True, one_rare_patch=True,
+            )
+            with self.assertWarns(UserWarning):
+                sampler = data.RareClassMixSampler(
+                    images, masks, seed=7, fractions={3: 0.25, 4: 0.15},
+                    min_pixels=1, max_patch_repeats=2, max_source_multiplier=1.0,
+                )
+            indices = list(sampler)
+            self.assertEqual(len(indices), 40)
+            self.assertLessEqual(np.bincount(indices, minlength=40).max(), 2)
+            np.testing.assert_array_equal(
+                np.bincount(sampler.source_ids[indices], minlength=4), [10, 10, 10, 10],
+            )
+            self.assertEqual(sampler.last_epoch_stats["sampling_targeted_uncertain_vessels"], 0)
+            self.assertLessEqual(sampler.last_epoch_stats["sampling_targeted_crossings"], 2)
+            self.assertGreaterEqual(sampler.last_epoch_stats["sampling_fallback_slots"], 14)
+
     def test_mask_decoder(self):
         rgb = np.array(list(settings.COLOR_MAP.values()), dtype=np.uint8)[None]
         np.testing.assert_array_equal(strict_rgb_to_labels(rgb), np.arange(5)[None])
@@ -117,7 +192,18 @@ class OverlapTests(unittest.TestCase):
                 torch.rand(2, 3, 32, 32), labels.unsqueeze(0).repeat(2, 1, 1)
             )
             dataset.mask_paths = [mask_path, mask_path]
-            loader = torch.utils.data.DataLoader(dataset, batch_size=2)
+            class RecordingSampler(torch.utils.data.Sampler):
+                def __init__(self):
+                    self.epochs, self.last_epoch_stats = [], {}
+                def set_epoch(self, epoch):
+                    self.epochs.append(epoch)
+                def __len__(self):
+                    return 2
+                def __iter__(self):
+                    self.last_epoch_stats = {"sampling_draws": 2}
+                    return iter([0, 1])
+            sampler = RecordingSampler()
+            loader = torch.utils.data.DataLoader(dataset, batch_size=2, sampler=sampler)
             model = ImprovedUNetPlusPlus(encoder_weights=None, device="cpu",
                                          union_coef=0.25, topology_coef=0.10)
             model.model = torch.nn.Conv2d(3, 5, kernel_size=1)
@@ -128,6 +214,8 @@ class OverlapTests(unittest.TestCase):
             self.assertEqual(len(model.history), 50)
             self.assertEqual(callbacks, list(range(1, 51)))
             self.assertEqual(model.scheduler.last_epoch, 50 * len(loader))
+            self.assertEqual(sampler.epochs, list(range(50)))
+            self.assertTrue(all(row["sampling_draws"] == 2 for row in model.history))
 
     def test_synthetic_data_model_checkpoint(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -158,6 +246,20 @@ class OverlapTests(unittest.TestCase):
                 validate_patient_splits(loaders, audit["patient_mapping"])
                 train, val = loaders[0]
                 manifest = fold_manifest(train, val, 1, audit)
+                self.assertEqual(manifest["training_sampler"], train.sampler.protocol_config)
+                train_keys = set(manifest["train_sources"])
+                self.assertTrue(set(train.sampler.source_keys).issubset(train_keys))
+                self.assertTrue(set(train.sampler.source_keys).isdisjoint(manifest["val_sources"]))
+                with patch.object(settings, "RARE_SAMPLER_ENABLED", False):
+                    baseline_loaders = data.create_cross_val_loaders(normalize, normalize, verbose=False)
+                    baseline_train, baseline_val = baseline_loaders[0]
+                    baseline_manifest = fold_manifest(baseline_train, baseline_val, 1, audit)
+                self.assertIsInstance(baseline_train.sampler, torch.utils.data.RandomSampler)
+                self.assertEqual(manifest["train_sources"], baseline_manifest["train_sources"])
+                self.assertEqual(manifest["val_sources"], baseline_manifest["val_sources"])
+                self.assertEqual(len(train), len(baseline_train))
+                self.assertNotEqual(manifest["protocol_sha256"], baseline_manifest["protocol_sha256"])
+                self.assertNotIn("training_sampler", baseline_manifest)
                 model = ImprovedUNetPlusPlus(encoder_weights=None, device="cpu")
                 weights = model._build_class_weights(train)
                 self.assertEqual(sum(model.class_counts), len(train.dataset) * 32 * 32)

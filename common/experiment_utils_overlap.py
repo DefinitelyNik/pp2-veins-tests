@@ -206,6 +206,11 @@ def fold_manifest(train_loader, val_loader, fold, audit):
         "num_workers": settings.NUM_WORKERS,
         "train_batches_per_epoch": len(train_loader),
     }
+    sampler_config = getattr(train_loader.sampler, "protocol_config", None)
+    if sampler_config is not None:
+        # Include the intervention in checkpoint compatibility checks.
+        # No extra field for uniform sampling: old baseline hashes stay valid.
+        payload["training_sampler"] = sampler_config
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     payload["protocol_sha256"] = hashlib.sha256(canonical.encode()).hexdigest()
     return payload
